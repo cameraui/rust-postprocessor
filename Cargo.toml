@@ -7,12 +7,12 @@ version = "0.0.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3.9.2", default-features = false, features = ["napi9"] }
+napi = { version = "3.9.3", default-features = false, features = ["napi9"] }
 napi-derive = "3.5.6"
 
 # Tracker engine — Rust port of the Python `norfair` library used by Frigate.
 # Same battle-tested algorithm: Kalman filter, IoU/Euclidean distance, ReID lifecycle.
-norfair-rs = { path = "../../externals/norfair-rs", default-features = false }
+norfair-rs = { path = "./externals/norfair-rs", default-features = false }
 
 # Stable nalgebra for the few places we construct DMatrix ourselves
 nalgebra = "0.35.0"
