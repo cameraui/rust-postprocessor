@@ -1,0 +1,26 @@
+{
+  "name": "@camera.ui/rust-postprocessor-linux-riscv64-gnu",
+  "version": "0.0.1",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "riscv64"
+  ],
+  "main": "rust-postprocessor.linux-riscv64-gnu.node",
+  "files": [
+    "rust-postprocessor.linux-riscv64-gnu.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameraui/rust-postprocessor.git",
+    "directory": "npm/linux-riscv64-gnu"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 10"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

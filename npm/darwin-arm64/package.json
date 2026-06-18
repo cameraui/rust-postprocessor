@@ -1,0 +1,23 @@
+{
+  "name": "@camera.ui/rust-postprocessor-darwin-arm64",
+  "version": "0.0.1",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "rust-postprocessor.darwin-arm64.node",
+  "files": [
+    "rust-postprocessor.darwin-arm64.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameraui/rust-postprocessor.git",
+    "directory": "npm/darwin-arm64"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 10"
+  }
+}

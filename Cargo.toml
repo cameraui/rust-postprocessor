@@ -1,0 +1,29 @@
+[package]
+edition = "2021"
+name = "cameraui-rust-postprocessor"
+version = "0.0.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.9.2", default-features = false, features = ["napi9"] }
+napi-derive = "3.5.6"
+
+# Tracker engine — Rust port of the Python `norfair` library used by Frigate.
+# Same battle-tested algorithm: Kalman filter, IoU/Euclidean distance, ReID lifecycle.
+norfair-rs = { path = "../../externals/norfair-rs", default-features = false }
+
+# Stable nalgebra for the few places we construct DMatrix ourselves
+nalgebra = "0.35.0"
+
+# SIMD primitives for our NMS implementation (f32x8 = 8 floats parallel).
+wide = "1.5.0"
+
+[build-dependencies]
+napi-build = "2.3.2"
+
+[profile.release]
+lto = true
+strip = "symbols"
+codegen-units = 1

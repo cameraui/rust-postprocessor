@@ -1,0 +1,23 @@
+{
+  "name": "@camera.ui/rust-postprocessor-win32-x64-msvc",
+  "version": "0.0.1",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "rust-postprocessor.win32-x64-msvc.node",
+  "files": [
+    "rust-postprocessor.win32-x64-msvc.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameraui/rust-postprocessor.git",
+    "directory": "npm/win32-x64-msvc"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 10"
+  }
+}
