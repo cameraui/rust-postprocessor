@@ -1,6 +1,6 @@
 {
   "name": "@camera.ui/rust-postprocessor",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Native Rust detection post-processing (NMS, IoU, merge, object tracking, line crossing & zone filtering) for the camera.ui ecosystem",
   "author": "seydx (https://github.com/seydx)",
   "main": "index.js",
