@@ -1,0 +1,3 @@
+[submodule "externals/norfair-rs"]
+	path = externals/norfair-rs
+	url = https://github.com/seydx/norfair-rs
