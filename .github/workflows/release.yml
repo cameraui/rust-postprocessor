@@ -118,7 +118,7 @@ jobs:
           submodules: recursive
       - name: Build
         id: build
-        uses: cross-platform-actions/action@v1.2.0
+        uses: cross-platform-actions/action@v1.3.0
         env:
           DEBUG: napi:*
           RUSTUP_IO_THREADS: 1
