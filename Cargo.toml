@@ -7,8 +7,8 @@ version = "0.0.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3.9.3", default-features = false, features = ["napi9"] }
-napi-derive = "3.5.6"
+napi = { version = "3.9.4", default-features = false, features = ["napi9"] }
+napi-derive = "3.5.7"
 
 # Tracker engine — Rust port of the Python `norfair` library used by Frigate.
 # Same battle-tested algorithm: Kalman filter, IoU/Euclidean distance, ReID lifecycle.
