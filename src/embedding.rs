@@ -36,11 +36,7 @@ pub fn compute_embedding(
 
   let mut emb = vec![0.0f64; EMBEDDING_SIZE];
 
-  compute_color_histogram(pixels, img_w, x0, y0, crop_w, crop_h, &mut emb[0..24]);
-  compute_gradient_histogram(pixels, img_w, x0, y0, crop_w, crop_h, &mut emb[24..40]);
-  compute_spatial_grid(pixels, img_w, x0, y0, crop_w, crop_h, &mut emb[40..56]);
-
-  emb[60] = compute_mean_brightness(pixels, img_w, x0, y0, crop_w, crop_h);
+  accumulate_features(pixels, img_w, x0, y0, crop_w, crop_h, &mut emb);
   emb[61] = crop_h as f64 / crop_w as f64;
 
   // Normalize histogram segments independently for scale invariance.
@@ -49,6 +45,97 @@ pub fn compute_embedding(
   l2_normalize(&mut emb[40..56]);
 
   Some(emb)
+}
+
+/// Fill the color histogram `[0..24]`, gradient histogram `[24..40]`, spatial
+/// grid `[40..56]` and mean brightness `[60]` in a single pass over the crop,
+/// so each pixel row is pulled through the cache once instead of four times.
+fn accumulate_features(
+  pixels: &[u8],
+  img_w: u32,
+  x0: u32,
+  y0: u32,
+  crop_w: u32,
+  crop_h: u32,
+  emb: &mut [f64],
+) {
+  let stride = (img_w * 3) as usize;
+  let mag_threshold = 30.0f32;
+  // Gradients need neighbors on both axes.
+  let gradients = crop_w >= 3 && crop_h >= 3;
+
+  let mut grid_counts = [0u32; 16];
+  let mut brightness_sum = 0u64;
+  let mut brightness_count = 0u64;
+
+  for dy in 0..crop_h {
+    let y = (y0 + dy) as usize;
+    let row_start = y * stride + (x0 as usize) * 3;
+    let cy = ((dy * 4) / crop_h).min(3) as usize;
+    let grad_row = gradients && dy >= 1 && dy < crop_h - 1;
+
+    for dx in 0..crop_w {
+      let off = row_start + (dx as usize) * 3;
+      if off + 2 >= pixels.len() {
+        continue;
+      }
+      let r = pixels[off];
+      let g = pixels[off + 1];
+      let b = pixels[off + 2];
+
+      let (h, s, v) = rgb_to_hsv(r, g, b);
+      let hbin = ((h * 8.0) as usize).min(7);
+      emb[hbin] += 1.0;
+      let sbin = ((s * 8.0) as usize).min(7);
+      emb[8 + sbin] += 1.0;
+      let vbin = ((v * 8.0) as usize).min(7);
+      emb[16 + vbin] += 1.0;
+
+      let cx = ((dx * 4) / crop_w).min(3) as usize;
+      let cell = cy * 4 + cx;
+      // Approximate luminance: (R + 2G + B) / 4.
+      let lum = (r as u32 + g as u32 * 2 + b as u32) / 4;
+      emb[40 + cell] += lum as f64;
+      grid_counts[cell] += 1;
+
+      brightness_sum += g as u64;
+      brightness_count += 1;
+
+      if grad_row && dx >= 1 && dx < crop_w - 1 {
+        let x = (x0 + dx) as usize;
+        // Green channel as a luma proxy.
+        let idx_l = y * stride + (x - 1) * 3 + 1;
+        let idx_r = y * stride + (x + 1) * 3 + 1;
+        let idx_u = (y - 1) * stride + x * 3 + 1;
+        let idx_d = (y + 1) * stride + x * 3 + 1;
+        if idx_d >= pixels.len() || idx_r >= pixels.len() {
+          continue;
+        }
+
+        let gx = pixels[idx_r] as f32 - pixels[idx_l] as f32;
+        let gy = pixels[idx_d] as f32 - pixels[idx_u] as f32;
+
+        let mag = (gx * gx + gy * gy).sqrt();
+        if mag < 1.0 {
+          continue;
+        }
+
+        let angle = gy.atan2(gx) + std::f32::consts::PI; // shift to [0, 2π)
+        let bin = (((angle / (2.0 * std::f32::consts::PI)) * 8.0) as usize).min(7);
+        let level = if mag > mag_threshold { 8 } else { 0 };
+        emb[24 + level + bin] += mag as f64;
+      }
+    }
+  }
+
+  for i in 0..16 {
+    if grid_counts[i] > 0 {
+      emb[40 + i] /= grid_counts[i] as f64 * 255.0;
+    }
+  }
+  if brightness_count > 0 {
+    emb[60] = brightness_sum as f64 / (brightness_count as f64 * 255.0);
+  }
 }
 
 /// Adaptive weighted cosine distance in `[0.0, 1.0]` (0 = identical). Color
@@ -105,163 +192,6 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
   };
 
   (h, s, v)
-}
-
-/// 24-element HSV histogram (8 bins × H/S/V).
-fn compute_color_histogram(
-  pixels: &[u8],
-  img_w: u32,
-  x0: u32,
-  y0: u32,
-  crop_w: u32,
-  crop_h: u32,
-  out: &mut [f64],
-) {
-  debug_assert!(out.len() >= 24);
-  let stride = (img_w * 3) as usize;
-
-  for dy in 0..crop_h {
-    let row_start = ((y0 + dy) as usize) * stride + (x0 as usize) * 3;
-    for dx in 0..crop_w {
-      let off = row_start + (dx as usize) * 3;
-      if off + 2 >= pixels.len() {
-        continue;
-      }
-      let (h, s, v) = rgb_to_hsv(pixels[off], pixels[off + 1], pixels[off + 2]);
-
-      let hbin = ((h * 8.0) as usize).min(7);
-      out[hbin] += 1.0;
-      let sbin = ((s * 8.0) as usize).min(7);
-      out[8 + sbin] += 1.0;
-      let vbin = ((v * 8.0) as usize).min(7);
-      out[16 + vbin] += 1.0;
-    }
-  }
-}
-
-/// 16-element gradient histogram: 8 directions × 2 magnitude levels.
-fn compute_gradient_histogram(
-  pixels: &[u8],
-  img_w: u32,
-  x0: u32,
-  y0: u32,
-  crop_w: u32,
-  crop_h: u32,
-  out: &mut [f64],
-) {
-  debug_assert!(out.len() >= 16);
-  let stride = (img_w * 3) as usize;
-
-  let mag_threshold = 30.0f32;
-
-  // Need neighbors on both axes.
-  if crop_w < 3 || crop_h < 3 {
-    return;
-  }
-
-  for dy in 1..crop_h - 1 {
-    let y = (y0 + dy) as usize;
-    for dx in 1..crop_w - 1 {
-      let x = (x0 + dx) as usize;
-
-      // Green channel as a luma proxy.
-      let _idx_c = y * stride + x * 3 + 1;
-      let idx_l = y * stride + (x - 1) * 3 + 1;
-      let idx_r = y * stride + (x + 1) * 3 + 1;
-      let idx_u = (y - 1) * stride + x * 3 + 1;
-      let idx_d = (y + 1) * stride + x * 3 + 1;
-
-      if idx_d >= pixels.len() || idx_r >= pixels.len() {
-        continue;
-      }
-
-      let gx = pixels[idx_r] as f32 - pixels[idx_l] as f32;
-      let gy = pixels[idx_d] as f32 - pixels[idx_u] as f32;
-
-      let mag = (gx * gx + gy * gy).sqrt();
-      if mag < 1.0 {
-        continue;
-      }
-
-      let angle = gy.atan2(gx) + std::f32::consts::PI; // shift to [0, 2π)
-      let bin = ((angle / (2.0 * std::f32::consts::PI)) * 8.0) as usize;
-      let bin = bin.min(7);
-
-      let level = if mag > mag_threshold { 8 } else { 0 };
-      out[level + bin] += mag as f64;
-    }
-  }
-}
-
-/// 4×4 spatial intensity grid (16 mean values).
-fn compute_spatial_grid(
-  pixels: &[u8],
-  img_w: u32,
-  x0: u32,
-  y0: u32,
-  crop_w: u32,
-  crop_h: u32,
-  out: &mut [f64],
-) {
-  debug_assert!(out.len() >= 16);
-  let stride = (img_w * 3) as usize;
-
-  let mut counts = [0u32; 16];
-
-  for dy in 0..crop_h {
-    let cy = ((dy * 4) / crop_h).min(3) as usize;
-    let row_start = ((y0 + dy) as usize) * stride + (x0 as usize) * 3;
-    for dx in 0..crop_w {
-      let cx = ((dx * 4) / crop_w).min(3) as usize;
-      let cell = cy * 4 + cx;
-
-      let off = row_start + (dx as usize) * 3;
-      if off + 2 >= pixels.len() {
-        continue;
-      }
-
-      // Approximate luminance: (R + 2G + B) / 4.
-      let lum = (pixels[off] as u32 + pixels[off + 1] as u32 * 2 + pixels[off + 2] as u32) / 4;
-      out[cell] += lum as f64;
-      counts[cell] += 1;
-    }
-  }
-
-  for i in 0..16 {
-    if counts[i] > 0 {
-      out[i] /= counts[i] as f64 * 255.0;
-    }
-  }
-}
-
-fn compute_mean_brightness(
-  pixels: &[u8],
-  img_w: u32,
-  x0: u32,
-  y0: u32,
-  crop_w: u32,
-  crop_h: u32,
-) -> f64 {
-  let stride = (img_w * 3) as usize;
-  let mut sum = 0u64;
-  let mut count = 0u64;
-
-  for dy in 0..crop_h {
-    let row_start = ((y0 + dy) as usize) * stride + (x0 as usize) * 3;
-    for dx in 0..crop_w {
-      let off = row_start + (dx as usize) * 3;
-      if off + 2 >= pixels.len() {
-        continue;
-      }
-      sum += pixels[off + 1] as u64;
-      count += 1;
-    }
-  }
-
-  if count == 0 {
-    return 0.0;
-  }
-  sum as f64 / (count as f64 * 255.0)
 }
 
 /// L2-normalize in place; zero-norm slices are left unchanged.

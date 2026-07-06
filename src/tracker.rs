@@ -18,6 +18,16 @@ use crate::line_crossing::{
 use crate::types::{CameraMotion, Detection, TrackedDetection};
 use crate::zone_filter::{filter_indices, prepare_zones, PreparedZones, ZoneInput};
 
+/// Convert a 2×2 corner-point matrix `[[x1, y1], [x2, y2]]` into the
+/// `[x, y, width, height]` layout `iou::box_iou` expects.
+fn corners_to_xywh(points: &DMatrix<f64>) -> [f32; 4] {
+  let x1 = points[(0, 0)] as f32;
+  let y1 = points[(0, 1)] as f32;
+  let x2 = points[(1, 0)] as f32;
+  let y2 = points[(1, 1)] as f32;
+  [x1, y1, (x2 - x1).max(0.0), (y2 - y1).max(0.0)]
+}
+
 /// Move items out of `src` at the given sorted indices without cloning.
 fn extract_by_indices(mut src: Vec<Detection>, indices: &[u32]) -> Vec<Detection> {
   if indices.len() == src.len() {
@@ -88,9 +98,10 @@ pub struct ObjectTracker {
   trackers: HashMap<String, ClassTracker>,
   next_track_id: u32,
   prepared_lines: Vec<PreparedLine>,
-  /// `(track_id, line_name)` pairs that have already fired, so a track can't
-  /// trigger the same line twice in its lifetime.
-  crossing_memory: HashSet<(u32, String)>,
+  /// `(track_id, line_index)` pairs that have already fired, so a track can't
+  /// trigger the same line twice in its lifetime. Indices stay valid because
+  /// the set is cleared whenever `set_lines` replaces `prepared_lines`.
+  crossing_memory: HashSet<(u32, u32)>,
   prepared_zones: PreparedZones,
   min_confidence: f32,
   frame_seq: u64,
@@ -290,11 +301,11 @@ impl ObjectTracker {
       }
 
       let det_label_lc = det.label.to_lowercase();
-      for line in &self.prepared_lines {
+      for (line_idx, line) in self.prepared_lines.iter().enumerate() {
         if !line.labels.is_empty() && !line.labels.contains(&det_label_lc) {
           continue;
         }
-        let memory_key = (det.track_id, line.name.clone());
+        let memory_key = (det.track_id, line_idx as u32);
         if self.crossing_memory.contains(&memory_key) {
           continue;
         }
@@ -411,25 +422,34 @@ impl ObjectTracker {
     let tag: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(FrameTag {
       frame_seq: current_frame,
     });
+    // Embeddings are only consumed by the ReID distance function, so skip the
+    // per-crop pixel work entirely while no ReID window is armed.
+    let reid_active = self.config.reid_hit_counter_max.is_some();
     let nf_detections: Vec<NfDetection> = detections
       .iter()
       .filter_map(|det| {
         let x2 = det.x + det.width;
         let y2 = det.y + det.height;
+        // Boxes are two corner points (2×2, row-major). norfair's coordinate
+        // transforms only apply to N×2 point matrices — a flat 1×4 layout
+        // would silently disable camera-motion compensation. The vectorized
+        // IoU distance flattens this row-major back to [x1, y1, x2, y2].
         let points =
-          DMatrix::from_row_slice(1, 4, &[det.x as f64, det.y as f64, x2 as f64, y2 as f64]);
+          DMatrix::from_row_slice(2, 2, &[det.x as f64, det.y as f64, x2 as f64, y2 as f64]);
         let mut nf = NfDetection::new(points).ok()?;
         nf.label = Some(det.label.clone());
-        nf.scores = Some(vec![det.confidence as f64]);
+        nf.scores = Some(vec![det.confidence as f64; 2]);
         nf.data = Some(tag.clone());
 
-        if let Some((pixels, img_w, img_h)) = frame {
-          nf.embedding = embedding::compute_embedding(
-            pixels,
-            img_w,
-            img_h,
-            [det.x, det.y, det.width, det.height],
-          );
+        if reid_active {
+          if let Some((pixels, img_w, img_h)) = frame {
+            nf.embedding = embedding::compute_embedding(
+              pixels,
+              img_w,
+              img_h,
+              [det.x, det.y, det.width, det.height],
+            );
+          }
         }
 
         Some(nf)
@@ -462,11 +482,13 @@ impl ObjectTracker {
     }
     // `obj.estimate` stays in the relative (image) frame, so it's already in
     // normalized `[0, 1]` coords for both matched and extrapolated tracks.
+    // Layout is the 2×2 corner-point matrix, velocity likewise (row-major
+    // `(num_points, dim_points)`).
     let raw: Vec<Raw> = active
       .into_iter()
       .filter_map(|obj| {
         let est = &obj.estimate;
-        if est.ncols() < 4 || est.nrows() < 1 {
+        if est.nrows() < 2 || est.ncols() < 2 {
           return None;
         }
         let confidence = obj
@@ -476,9 +498,9 @@ impl ObjectTracker {
           .and_then(|s| s.first().copied())
           .unwrap_or(0.0) as f32;
         let vel = &obj.estimate_velocity;
-        let (vx, vy, speed) = if vel.ncols() >= 4 && vel.nrows() >= 1 {
-          let vcx = ((vel[(0, 0)] + vel[(0, 2)]) / 2.0) as f32;
-          let vcy = ((vel[(0, 1)] + vel[(0, 3)]) / 2.0) as f32;
+        let (vx, vy, speed) = if vel.nrows() >= 2 && vel.ncols() >= 2 {
+          let vcx = ((vel[(0, 0)] + vel[(1, 0)]) / 2.0) as f32;
+          let vcy = ((vel[(0, 1)] + vel[(1, 1)]) / 2.0) as f32;
           (vcx, vcy, (vcx * vcx + vcy * vcy).sqrt())
         } else {
           (0.0, 0.0, 0.0)
@@ -494,8 +516,8 @@ impl ObjectTracker {
           norfair_global_id: obj.global_id,
           x1: est[(0, 0)],
           y1: est[(0, 1)],
-          x2: est[(0, 2)],
-          y2: est[(0, 3)],
+          x2: est[(1, 0)],
+          y2: est[(1, 1)],
           confidence,
           age: obj.age.max(0) as u32,
           speed,
@@ -566,49 +588,49 @@ impl ObjectTracker {
 
     // ReID via embedding cosine distance, falling back to IoU when either
     // side has no embedding (e.g. no frame was provided).
-    if let Some(reid_max) = self.config.reid_hit_counter_max {
-      let reid_distance = ScalarDistance::new(
-        move |candidate: &NfDetection, dead_track: &TrackedObject| -> f64 {
-          let cand_emb = candidate.embedding.as_ref();
-          let track_emb = dead_track
-            .past_detections
-            .iter()
-            .rev()
-            .find_map(|d| d.embedding.as_ref());
+    //
+    // The distance function is installed unconditionally: sub-trackers are
+    // created lazily on a label's first detection, which usually happens
+    // BEFORE the first ReID window opens (the cascade activates in reaction
+    // to detections). Whether ReID actually runs is gated solely by
+    // `reid_hit_counter_max`, which `set_reid_hit_counter_max` updates on
+    // live sub-trackers; norfair skips the ReID stage entirely while it is
+    // `None`.
+    let reid_distance = ScalarDistance::new(
+      move |candidate: &NfDetection, dead_track: &TrackedObject| -> f64 {
+        let cand_emb = candidate.embedding.as_ref();
+        let track_emb = dead_track
+          .past_detections
+          .iter()
+          .rev()
+          .find_map(|d| d.embedding.as_ref());
 
-          match (cand_emb, track_emb) {
-            (Some(a), Some(b)) => embedding::embedding_distance(a, b),
-            _ => {
-              let cand_pts = &candidate.points;
-              let track_est = &dead_track.estimate;
-              if cand_pts.ncols() >= 4 && track_est.ncols() >= 4 {
-                let a = [
-                  cand_pts[(0, 0)] as f32,
-                  cand_pts[(0, 1)] as f32,
-                  cand_pts[(0, 2)] as f32,
-                  cand_pts[(0, 3)] as f32,
-                ];
-                let b = [
-                  track_est[(0, 0)] as f32,
-                  track_est[(0, 1)] as f32,
-                  track_est[(0, 2)] as f32,
-                  track_est[(0, 3)] as f32,
-                ];
-                let iou = crate::iou::box_iou(&a, &b);
-                (1.0 - iou) as f64
-              } else {
-                f64::INFINITY
-              }
+        match (cand_emb, track_emb) {
+          (Some(a), Some(b)) => embedding::embedding_distance(a, b),
+          _ => {
+            let cand_pts = &candidate.points;
+            let track_est = &dead_track.estimate;
+            if cand_pts.nrows() >= 2
+              && cand_pts.ncols() >= 2
+              && track_est.nrows() >= 2
+              && track_est.ncols() >= 2
+            {
+              let a = corners_to_xywh(cand_pts);
+              let b = corners_to_xywh(track_est);
+              let iou = crate::iou::box_iou(&a, &b);
+              (1.0 - iou) as f64
+            } else {
+              f64::INFINITY
             }
           }
-        },
-      );
+        }
+      },
+    );
 
-      cfg.reid_distance_function = Some(DistanceFunction::Frobenius(reid_distance));
-      cfg.reid_distance_threshold = self.config.reid_embedding_threshold;
-      cfg.reid_hit_counter_max = Some(reid_max);
-      cfg.past_detections_length = 3;
-    }
+    cfg.reid_distance_function = Some(DistanceFunction::Frobenius(reid_distance));
+    cfg.reid_distance_threshold = self.config.reid_embedding_threshold;
+    cfg.reid_hit_counter_max = self.config.reid_hit_counter_max;
+    cfg.past_detections_length = 3;
 
     cfg
   }
@@ -1024,6 +1046,277 @@ mod tests {
       !has_old,
       "ReID should have expired — old id {} should not appear",
       id
+    );
+  }
+
+  /// A world-static object under a panning camera: per-frame image shift is
+  /// far above the IoU match threshold, so the track only survives if the
+  /// camera-motion transform actually reaches the Kalman filter (2×2 corner
+  /// layout — a 1×4 layout silently disables `TranslationTransformation`).
+  #[test]
+  fn camera_motion_keeps_track_id_across_pan() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 5,
+      initialization_delay: 0,
+      ..Default::default()
+    });
+
+    // Scene flow: the camera pans, the world drifts right in the image by
+    // 0.15 per frame. Detections image at world + motion.
+    let world = det(0.30, 0.40, 0.20, 0.20, "person");
+    let mut first_id = None;
+    for frame in 0..4 {
+      let m = frame as f32 * 0.15;
+      let d = det(world.x + m, world.y, world.width, world.height, "person");
+      let motion = CameraMotion {
+        x: m as f64,
+        y: 0.0,
+      };
+      let res = t.update(vec![d], frame as f64 * 100.0, None, Some(motion));
+      assert_eq!(res.tracked.len(), 1, "frame {frame}: track must survive");
+      let tracked = &res.tracked[0];
+      match first_id {
+        None => first_id = Some(tracked.track_id),
+        Some(id) => assert_eq!(
+          tracked.track_id, id,
+          "frame {frame}: pan must not break the track"
+        ),
+      }
+      // Output stays in the relative (image) frame.
+      assert!(
+        (tracked.x - (world.x + m)).abs() < 0.05,
+        "frame {frame}: box must follow the image position, got {}",
+        tracked.x
+      );
+    }
+  }
+
+  /// Without camera-motion input the same pan must break the track — this
+  /// guards the test above against passing for the wrong reason (e.g. an
+  /// overly lenient default threshold).
+  #[test]
+  fn pan_without_camera_motion_breaks_track() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 5,
+      initialization_delay: 0,
+      ..Default::default()
+    });
+
+    let mut ids = std::collections::HashSet::new();
+    for frame in 0..4 {
+      let m = frame as f32 * 0.15;
+      let d = det(0.30 + m, 0.40, 0.20, 0.20, "person");
+      let res = t.update(vec![d], frame as f64 * 100.0, None, None);
+      for tracked in &res.tracked {
+        ids.insert(tracked.track_id);
+      }
+    }
+    assert!(
+      ids.len() > 1,
+      "0.15/frame jumps at iou_threshold 0.3 must spawn new ids without motion compensation"
+    );
+  }
+
+  /// PTZ autotracking: the camera follows a moving object, keeping it
+  /// centered in the image. The image position barely changes while the
+  /// accumulated motion offset grows — the track must stay stable, and the
+  /// reported velocity must reflect the WORLD motion, not the (near-zero)
+  /// image motion.
+  #[test]
+  fn ptz_follow_keeps_track_and_reports_world_velocity() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 5,
+      initialization_delay: 0,
+      ..Default::default()
+    });
+
+    // Object walks +0.05/frame in world x; the camera pans along, so the
+    // scene flow offset is -world_motion and the image position is constant.
+    let mut first_id = None;
+    let mut last = None;
+    for frame in 0..10 {
+      let world_x = 0.10 + frame as f32 * 0.05;
+      let motion_x = -(frame as f32) * 0.05;
+      let d = det(world_x + motion_x, 0.40, 0.20, 0.20, "person");
+      assert!((d.x - 0.10).abs() < 1e-5, "object must stay image-centered");
+      let res = t.update(
+        vec![d],
+        frame as f64 * 100.0,
+        None,
+        Some(CameraMotion {
+          x: motion_x as f64,
+          y: 0.0,
+        }),
+      );
+      assert_eq!(res.tracked.len(), 1, "frame {frame}");
+      let tracked = res.tracked.into_iter().next().unwrap();
+      match first_id {
+        None => first_id = Some(tracked.track_id),
+        Some(id) => assert_eq!(tracked.track_id, id, "frame {frame}: id must survive follow"),
+      }
+      last = Some(tracked);
+    }
+
+    let last = last.unwrap();
+    assert!(
+      (last.x - 0.10).abs() < 0.05,
+      "followed object must stay near the image position, got {}",
+      last.x
+    );
+    assert!(
+      last.track_velocity_x > 0.005,
+      "world velocity must be visible despite a static image position, got {}",
+      last.track_velocity_x
+    );
+    assert!(
+      last.track_speed > 0.005,
+      "track_speed must reflect world motion, got {}",
+      last.track_speed
+    );
+  }
+
+  /// PTZ pan away and back: a world-static object drifts out and back in the
+  /// image. With motion compensation the id must survive the round trip.
+  #[test]
+  fn ptz_pan_away_and_back_keeps_id() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 5,
+      initialization_delay: 0,
+      ..Default::default()
+    });
+
+    // Accumulated scene-flow offsets: out to +0.45 and back to 0.
+    let offsets = [0.0f32, 0.15, 0.30, 0.45, 0.30, 0.15, 0.0];
+    let world = det(0.20, 0.40, 0.20, 0.20, "person");
+    let mut first_id = None;
+    for (frame, &m) in offsets.iter().enumerate() {
+      let d = det(world.x + m, world.y, world.width, world.height, "person");
+      let res = t.update(
+        vec![d],
+        frame as f64 * 100.0,
+        None,
+        Some(CameraMotion {
+          x: m as f64,
+          y: 0.0,
+        }),
+      );
+      assert_eq!(res.tracked.len(), 1, "frame {frame}");
+      match first_id {
+        None => first_id = Some(res.tracked[0].track_id),
+        Some(id) => assert_eq!(
+          res.tracked[0].track_id, id,
+          "frame {frame}: id must survive pan away and back"
+        ),
+      }
+    }
+  }
+
+  /// Two world-static objects under a diagonal pan: both ids must survive
+  /// and must not get swapped between the objects.
+  #[test]
+  fn ptz_pan_does_not_swap_ids_between_objects() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 5,
+      initialization_delay: 0,
+      ..Default::default()
+    });
+
+    let a_world = det(0.10, 0.20, 0.15, 0.15, "person");
+    let b_world = det(0.45, 0.55, 0.15, 0.15, "person");
+    let mut id_by_slot: Option<(u32, u32)> = None;
+
+    for frame in 0..6 {
+      let mx = frame as f32 * 0.08;
+      let my = frame as f32 * 0.05;
+      let a = det(a_world.x + mx, a_world.y + my, 0.15, 0.15, "person");
+      let b = det(b_world.x + mx, b_world.y + my, 0.15, 0.15, "person");
+      let res = t.update(
+        vec![a, b],
+        frame as f64 * 100.0,
+        None,
+        Some(CameraMotion {
+          x: mx as f64,
+          y: my as f64,
+        }),
+      );
+      assert_eq!(res.tracked.len(), 2, "frame {frame}");
+
+      // Identify by x-position: `a` is always the left box.
+      let (left, right) = if res.tracked[0].x < res.tracked[1].x {
+        (&res.tracked[0], &res.tracked[1])
+      } else {
+        (&res.tracked[1], &res.tracked[0])
+      };
+      match id_by_slot {
+        None => id_by_slot = Some((left.track_id, right.track_id)),
+        Some((a_id, b_id)) => {
+          assert_eq!(left.track_id, a_id, "frame {frame}: left id must not change");
+          assert_eq!(right.track_id, b_id, "frame {frame}: right id must not change");
+        }
+      }
+    }
+  }
+
+  /// ReID must also work for sub-trackers created BEFORE the ReID window is
+  /// armed: cascades enable ReID in reaction to detections, so the label's
+  /// sub-tracker almost always exists first.
+  #[test]
+  fn reid_works_when_enabled_after_tracker_creation() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 3,
+      initialization_delay: 1,
+      reid_hit_counter_max: None,
+      ..Default::default()
+    });
+
+    // Sub-tracker for "person" is created while ReID is disabled.
+    let _ = t.update(vec![det(0.30, 0.30, 0.20, 0.20, "person")], 0.0, None, None);
+    let r2 = t.update(
+      vec![det(0.30, 0.30, 0.20, 0.20, "person")],
+      100.0,
+      None,
+      None,
+    );
+    assert_eq!(r2.tracked.len(), 1);
+    let id = r2.tracked[0].track_id;
+    let _ = t.update(
+      vec![det(0.30, 0.30, 0.20, 0.20, "person")],
+      200.0,
+      None,
+      None,
+    );
+
+    // Cascade activates: ReID armed only now.
+    t.set_reid_hit_counter_max(50);
+
+    // Disappear long enough to die but stay within the ReID window.
+    for i in 3..13 {
+      t.update(Vec::new(), (i * 100) as f64, None, None);
+    }
+
+    let _ = t.update(
+      vec![det(0.30, 0.30, 0.20, 0.20, "person")],
+      1300.0,
+      None,
+      None,
+    );
+    let r_back = t.update(
+      vec![det(0.30, 0.30, 0.20, 0.20, "person")],
+      1400.0,
+      None,
+      None,
+    );
+
+    let found = r_back.tracked.iter().any(|t| t.track_id == id);
+    assert!(
+      found,
+      "late-enabled ReID must restore old track id {} (got: {:?})",
+      id,
+      r_back
+        .tracked
+        .iter()
+        .map(|t| t.track_id)
+        .collect::<Vec<_>>()
     );
   }
 

@@ -1,7 +1,7 @@
 //! Greedy per-class NMS. SoA layout lets the inner IoU loop process eight
 //! boxes at once via `wide::f32x8`. Output is sorted by confidence descending.
 
-use wide::{f32x8, CmpGt};
+use wide::f32x8;
 
 use crate::types::Detection;
 

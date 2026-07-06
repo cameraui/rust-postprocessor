@@ -100,6 +100,7 @@ pub fn prepare_lines(lines: &[DetectionLineInput], aspect_ratio: f32) -> Vec<Pre
 /// Intersect track segment `(a,b)` with line `(c,d)`. Returns the signed cross
 /// product (positive A->B, negative B->A), or 0 if disjoint or parallel.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn segment_intersection(
   ax: f32,
   ay: f32,

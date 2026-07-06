@@ -33,8 +33,7 @@
     "lint": "cargo clippy --fix --allow-dirty && eslint --fix .",
     "prepublishOnly": "napi prepublish --no-gh-release",
     "release": "bash scripts/release.sh",
-    "test:watch": "node --import tsx --watch test/index.ts",
-    "test": "node --import tsx test/index.ts",
+    "test": "cargo test --release",
     "universal": "napi universal",
     "update": "updates --update ./",
     "version": "napi version"
@@ -50,10 +49,10 @@
     "prettier": "^3.9.4",
     "rimraf": "^6.1.3",
     "set-interval-async": "^3.0.3",
-    "sharp": "^0.35.2",
+    "sharp": "^0.35.3",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.62.1",
-    "updates": "^17.18.1"
+    "updates": "^17.18.2"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rust-postprocessor/issues"

@@ -255,38 +255,24 @@ pub fn filter_indices(
         continue;
       }
       let intersects = box_intersects_polygon(det, &zone.points);
-      let contained = intersects && box_contained_in_polygon(det, &zone.points);
+      // `intersect` triggers on any overlap, `contain` only when the box is
+      // fully inside — the same rule for include and exclude zones.
+      let in_zone = match zone.match_type {
+        ZoneMatchType::Intersect => intersects,
+        ZoneMatchType::Contain => intersects && box_contained_in_polygon(det, &zone.points),
+      };
 
       match zone.filter {
-        ZoneFilterMode::Exclude => match zone.match_type {
-          ZoneMatchType::Contain => {
-            if intersects {
-              dropped = true;
-              break;
-            }
+        ZoneFilterMode::Exclude => {
+          if in_zone {
+            dropped = true;
+            break;
           }
-          ZoneMatchType::Intersect => {
-            if intersects || contained {
-              dropped = true;
-              break;
-            }
-          }
-        },
+        }
         ZoneFilterMode::Include => {
           has_include_zone = true;
-          if !satisfies_include {
-            match zone.match_type {
-              ZoneMatchType::Contain => {
-                if contained {
-                  satisfies_include = true;
-                }
-              }
-              ZoneMatchType::Intersect => {
-                if intersects {
-                  satisfies_include = true;
-                }
-              }
-            }
+          if in_zone {
+            satisfies_include = true;
           }
         }
       }
@@ -414,6 +400,49 @@ mod tests {
     let out = filter_detections(vec![inside, outside], &zones, 0.0);
     assert_eq!(out.len(), 1);
     assert!((out[0].x - 0.05).abs() < 1e-6);
+  }
+
+  #[test]
+  fn exclude_contain_keeps_partial_overlap() {
+    let zones = prepare_zones(&[rect_zone(
+      25.0,
+      25.0,
+      75.0,
+      75.0,
+      ZoneFilterMode::Exclude,
+      ZoneMatchType::Contain,
+      vec![],
+    )]);
+    // Straddles the zone boundary: not fully contained, must survive.
+    let partial = det(0.70, 0.30, 0.20, 0.20, "person");
+    // Fully inside the zone: must be dropped.
+    let inside = det(0.40, 0.40, 0.10, 0.10, "person");
+    let out = filter_detections(vec![partial, inside], &zones, 0.0);
+    assert_eq!(out.len(), 1);
+    assert!(
+      (out[0].x - 0.70).abs() < 1e-6,
+      "partial overlap must survive Exclude+Contain"
+    );
+  }
+
+  #[test]
+  fn exclude_intersect_drops_partial_overlap() {
+    let zones = prepare_zones(&[rect_zone(
+      25.0,
+      25.0,
+      75.0,
+      75.0,
+      ZoneFilterMode::Exclude,
+      ZoneMatchType::Intersect,
+      vec![],
+    )]);
+    let partial = det(0.70, 0.30, 0.20, 0.20, "person");
+    let out = filter_detections(vec![partial], &zones, 0.0);
+    assert_eq!(
+      out.len(),
+      0,
+      "any overlap must be dropped with Exclude+Intersect"
+    );
   }
 
   #[test]
