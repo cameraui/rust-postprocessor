@@ -1152,7 +1152,10 @@ mod tests {
       let tracked = res.tracked.into_iter().next().unwrap();
       match first_id {
         None => first_id = Some(tracked.track_id),
-        Some(id) => assert_eq!(tracked.track_id, id, "frame {frame}: id must survive follow"),
+        Some(id) => assert_eq!(
+          tracked.track_id, id,
+          "frame {frame}: id must survive follow"
+        ),
       }
       last = Some(tracked);
     }
@@ -1250,8 +1253,14 @@ mod tests {
       match id_by_slot {
         None => id_by_slot = Some((left.track_id, right.track_id)),
         Some((a_id, b_id)) => {
-          assert_eq!(left.track_id, a_id, "frame {frame}: left id must not change");
-          assert_eq!(right.track_id, b_id, "frame {frame}: right id must not change");
+          assert_eq!(
+            left.track_id, a_id,
+            "frame {frame}: left id must not change"
+          );
+          assert_eq!(
+            right.track_id, b_id,
+            "frame {frame}: right id must not change"
+          );
         }
       }
     }
