@@ -74,7 +74,7 @@
   "optionalDependencies": {
     "@camera.ui/rust-postprocessor-darwin-x64": "0.0.4",
     "@camera.ui/rust-postprocessor-win32-x64-msvc": "0.0.4",
-    "@camera.ui/rust-postprocessor-linux-x64-gnu": "0.0.4",
+    "@camera.ui/rust-postprocessor-linux-x64-gnu": "0.0.5",
     "@camera.ui/rust-postprocessor-linux-x64-musl": "0.0.4",
     "@camera.ui/rust-postprocessor-freebsd-x64": "0.0.4",
     "@camera.ui/rust-postprocessor-darwin-arm64": "0.0.4",
