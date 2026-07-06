@@ -79,7 +79,7 @@
     "@camera.ui/rust-postprocessor-freebsd-x64": "0.0.4",
     "@camera.ui/rust-postprocessor-darwin-arm64": "0.0.4",
     "@camera.ui/rust-postprocessor-win32-arm64-msvc": "0.0.4",
-    "@camera.ui/rust-postprocessor-linux-arm64-gnu": "0.0.4",
+    "@camera.ui/rust-postprocessor-linux-arm64-gnu": "0.0.5",
     "@camera.ui/rust-postprocessor-linux-arm64-musl": "0.0.4",
     "@camera.ui/rust-postprocessor-linux-riscv64-gnu": "0.0.4"
   }
