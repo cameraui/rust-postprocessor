@@ -181,29 +181,29 @@ impl ObjectTracker {
     self.crossing_memory.clear();
   }
 
-  /// Drop everything except established tracks currently below the speed
-  /// threshold, and return the surviving external track ids. Used at event
-  /// end instead of `reset()`: parked objects keep their identity across
-  /// events (so they can stay suppressed), while moving tracks are dropped —
-  /// their Kalman velocity would extrapolate them into ghosts after a long
+  /// Drop everything except the established tracks with the given external
+  /// ids, and return the ids that actually survived. Used at event end
+  /// instead of `reset()`: the caller keeps its known-stationary tracks (e.g.
+  /// parked cars) alive across events, while everything else is dropped —
+  /// stale moving tracks would Kalman-extrapolate into ghosts after a long
   /// gap between events.
-  pub fn retain_stationary(&mut self, speed_threshold: f32) -> Vec<u32> {
+  pub fn retain_tracks(&mut self, track_ids: &[u32]) -> Vec<u32> {
     let hit_counter_max = self.config.hit_counter_max;
+    let keep: HashSet<u32> = track_ids.iter().copied().collect();
 
     for class in self.trackers.values_mut() {
+      let kept_global_ids: HashSet<i32> = class
+        .id_map
+        .iter()
+        .filter(|(_, tid)| keep.contains(tid))
+        .map(|(gid, _)| *gid)
+        .collect();
+
       class.tracker.tracked_objects.retain(|obj| {
         if obj.is_initializing || obj.hit_counter < 0 {
           return false;
         }
-        let vel = &obj.estimate_velocity;
-        let speed = if vel.nrows() >= 2 && vel.ncols() >= 2 {
-          let vcx = ((vel[(0, 0)] + vel[(1, 0)]) / 2.0) as f32;
-          let vcy = ((vel[(0, 1)] + vel[(1, 1)]) / 2.0) as f32;
-          (vcx * vcx + vcy * vcy).sqrt()
-        } else {
-          0.0
-        };
-        speed < speed_threshold
+        kept_global_ids.contains(&obj.global_id)
       });
 
       // Top up the hit counter so a brief occlusion at the start of the next
@@ -904,7 +904,7 @@ mod tests {
   }
 
   #[test]
-  fn retain_stationary_keeps_parked_drops_moving() {
+  fn retain_tracks_keeps_listed_drops_rest() {
     let mut t = ObjectTracker::new(ObjectTrackerConfig {
       hit_counter_max: 5,
       initialization_delay: 0,
@@ -912,9 +912,10 @@ mod tests {
     });
 
     // One parked car, one moving person, tracked over a few frames.
+    let mut vehicle_id = 0u32;
     for i in 0..6 {
       let x = 0.10 + i as f32 * 0.05;
-      t.update(
+      let r = t.update(
         vec![
           det(0.60, 0.60, 0.20, 0.20, "vehicle"),
           det(x, 0.10, 0.20, 0.20, "person"),
@@ -923,11 +924,14 @@ mod tests {
         None,
         None,
       );
+      if let Some(v) = r.tracked.iter().find(|d| d.label == "vehicle") {
+        vehicle_id = v.track_id;
+      }
     }
     assert_eq!(t.track_count(), 2);
 
-    let survivors = t.retain_stationary(0.002);
-    assert_eq!(survivors.len(), 1, "only the parked vehicle should survive");
+    let survivors = t.retain_tracks(&[vehicle_id]);
+    assert_eq!(survivors, vec![vehicle_id]);
     assert_eq!(t.track_count(), 1);
 
     // The survivor keeps its identity on the next update at the same spot.
@@ -938,7 +942,7 @@ mod tests {
       None,
     );
     assert_eq!(r.tracked.len(), 1);
-    assert_eq!(r.tracked[0].track_id, survivors[0]);
+    assert_eq!(r.tracked[0].track_id, vehicle_id);
   }
 
   #[test]
