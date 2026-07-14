@@ -47,6 +47,12 @@ export declare class ObjectTracker {
   filterIndices(detections: Array<Detection>): Array<number>
   /** Drop every active track; the next `update()` restarts ids from 1. */
   reset(): void
+  /**
+   * Drop everything except established tracks currently below the speed
+   * threshold and return the surviving track ids. Lets parked objects keep
+   * their identity across events so they can stay suppressed.
+   */
+  retainStationary(speedThreshold: number): Array<number>
   get trackCount(): number
 }
 

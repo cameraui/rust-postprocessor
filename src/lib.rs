@@ -432,6 +432,14 @@ impl ObjectTracker {
     self.inner.reset();
   }
 
+  /// Drop everything except established tracks currently below the speed
+  /// threshold and return the surviving track ids. Lets parked objects keep
+  /// their identity across events so they can stay suppressed.
+  #[napi]
+  pub fn retain_stationary(&mut self, speed_threshold: f64) -> Vec<u32> {
+    self.inner.retain_stationary(speed_threshold as f32)
+  }
+
   #[napi(getter)]
   pub fn track_count(&self) -> u32 {
     self.inner.track_count() as u32
