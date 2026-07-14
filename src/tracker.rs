@@ -91,6 +91,11 @@ struct FrameTag {
 pub struct UpdateResult {
   pub tracked: Vec<TrackedDetection>,
   pub crossings: Vec<LineCrossingEvent>,
+  /// External ids of tracks that got their permanent id this frame.
+  pub created: Vec<u32>,
+  /// External ids of tracks the tracker dropped this frame (hit counter
+  /// exhausted without a fresh match).
+  pub removed: Vec<u32>,
 }
 
 pub struct ObjectTracker {
@@ -261,6 +266,8 @@ impl ObjectTracker {
   ) -> UpdateResult {
     self.frame_seq += 1;
 
+    let alive_before = self.alive_external_ids();
+
     let detections = {
       let indices = filter_indices(&detections, &self.prepared_zones, self.min_confidence);
       extract_by_indices(detections, &indices)
@@ -316,7 +323,43 @@ impl ObjectTracker {
       c
     };
 
-    UpdateResult { tracked, crossings }
+    let alive_after = self.alive_external_ids();
+    let created: Vec<u32> = alive_after.difference(&alive_before).copied().collect();
+    let removed: Vec<u32> = alive_before.difference(&alive_after).copied().collect();
+
+    // Prune bookkeeping for dropped tracks — their external ids never return.
+    if !removed.is_empty() {
+      let removed_set: HashSet<u32> = removed.iter().copied().collect();
+      for class in self.trackers.values_mut() {
+        class.id_map.retain(|_, tid| !removed_set.contains(tid));
+        class
+          .prev_centroid_map
+          .retain(|tid, _| !removed_set.contains(tid));
+      }
+      self
+        .crossing_memory
+        .retain(|(tid, _)| !removed_set.contains(tid));
+    }
+
+    UpdateResult {
+      tracked,
+      crossings,
+      created,
+      removed,
+    }
+  }
+
+  /// External ids of all tracks currently alive in any class tracker.
+  fn alive_external_ids(&self) -> HashSet<u32> {
+    let mut alive = HashSet::new();
+    for class in self.trackers.values() {
+      for obj in &class.tracker.tracked_objects {
+        if let Some(&tid) = class.id_map.get(&obj.global_id) {
+          alive.insert(tid);
+        }
+      }
+    }
+    alive
   }
 
   /// Tick every sub-tracker with no detections.

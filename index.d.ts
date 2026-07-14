@@ -180,6 +180,10 @@ export interface TrackedDetection {
 export interface UpdateResult {
   tracked: Array<TrackedDetection>
   crossings: Array<LineCrossingEvent>
+  /** Track ids that got their permanent id this frame. */
+  created: Array<number>
+  /** Track ids the tracker dropped this frame (hit counter exhausted). */
+  removed: Array<number>
 }
 
 export declare const enum ZoneFilterMode {

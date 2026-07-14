@@ -126,6 +126,10 @@ pub struct LineCrossingEvent {
 pub struct UpdateResult {
   pub tracked: Vec<TrackedDetection>,
   pub crossings: Vec<LineCrossingEvent>,
+  /// Track ids that got their permanent id this frame.
+  pub created: Vec<u32>,
+  /// Track ids the tracker dropped this frame (hit counter exhausted).
+  pub removed: Vec<u32>,
 }
 
 #[napi(object)]
@@ -369,6 +373,8 @@ impl ObjectTracker {
           curr_y: c.curr_pos[1] as f64,
         })
         .collect(),
+      created: result.created,
+      removed: result.removed,
     }
   }
 
