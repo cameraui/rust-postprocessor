@@ -81,6 +81,6 @@
     "@camera.ui/rust-postprocessor-win32-arm64-msvc": "0.0.5",
     "@camera.ui/rust-postprocessor-linux-arm64-gnu": "0.0.5",
     "@camera.ui/rust-postprocessor-linux-arm64-musl": "0.0.5",
-    "@camera.ui/rust-postprocessor-linux-riscv64-gnu": "0.0.5"
+    "@camera.ui/rust-postprocessor-linux-riscv64-gnu": "0.0.8"
   }
 }
