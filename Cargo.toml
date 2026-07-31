@@ -18,7 +18,7 @@ norfair-rs = { path = "./externals/norfair-rs", default-features = false }
 nalgebra = "0.35.0"
 
 # SIMD primitives for our NMS implementation (f32x8 = 8 floats parallel).
-wide = "1.5.0"
+wide = "1.6.0"
 
 [build-dependencies]
 napi-build = "2.4.0"
