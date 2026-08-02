@@ -158,6 +158,11 @@ export interface ObjectTrackerOptions {
    * buffer is passed to `update()`. Default 0.4.
    */
   reidEmbeddingThreshold?: number
+  /**
+   * Mean corner distance threshold in normalized units. When set, matching
+   * tolerates movement beyond IoU overlap (slow detectors). Default: disabled.
+   */
+  motionTolerance?: number
 }
 
 export interface TrackedDetection {
