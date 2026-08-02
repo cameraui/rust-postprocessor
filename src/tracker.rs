@@ -57,6 +57,11 @@ pub struct ObjectTrackerConfig {
   pub reid_hit_counter_max: Option<i32>,
   /// Cosine distance threshold for appearance-based ReID matching.
   pub reid_embedding_threshold: f64,
+  /// When set, matching uses mean corner distance (normalized units) with
+  /// this threshold instead of IoU. A slow detector's inter-frame movement
+  /// can exceed the box size and zero out IoU entirely; distance matching
+  /// keeps the track alive across those gaps.
+  pub motion_tolerance: Option<f32>,
 }
 
 impl Default for ObjectTrackerConfig {
@@ -67,6 +72,7 @@ impl Default for ObjectTrackerConfig {
       initialization_delay: 3,
       reid_hit_counter_max: None,
       reid_embedding_threshold: 0.4,
+      motion_tolerance: None,
     }
   }
 }
@@ -684,8 +690,11 @@ impl ObjectTracker {
 
   fn build_nf_config(&self) -> TrackerConfig {
     // norfair's IoU distance is 1 - IoU, so the match threshold is inverted.
-    let distance_threshold = (1.0 - self.config.iou_threshold).max(0.0) as f64;
-    let mut cfg = TrackerConfig::new(distance_function_by_name("iou"), distance_threshold);
+    let (distance_name, distance_threshold) = match self.config.motion_tolerance {
+      Some(tolerance) => ("mean_euclidean", tolerance as f64),
+      None => ("iou", (1.0 - self.config.iou_threshold).max(0.0) as f64),
+    };
+    let mut cfg = TrackerConfig::new(distance_function_by_name(distance_name), distance_threshold);
     cfg.hit_counter_max = self.config.hit_counter_max;
     cfg.initialization_delay = self.config.initialization_delay;
 
@@ -1471,6 +1480,63 @@ mod tests {
         .iter()
         .map(|t| t.track_id)
         .collect::<Vec<_>>()
+    );
+  }
+
+  /// A slow detector: the object jumps by more than its own width per frame,
+  /// so consecutive detections have zero IoU. Distance matching must hold one
+  /// id where IoU matching cannot confirm anything.
+  #[test]
+  fn motion_tolerance_tracks_across_iou_gaps() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 3,
+      initialization_delay: 1,
+      motion_tolerance: Some(0.3),
+      ..Default::default()
+    });
+
+    let mut ids = std::collections::HashSet::new();
+    for frame in 0..5 {
+      let x = 0.05 + frame as f32 * 0.18;
+      let res = t.update(
+        vec![det(x, 0.30, 0.12, 0.35, "person")],
+        frame as f64 * 1000.0,
+        None,
+        None,
+      );
+      for tracked in &res.tracked {
+        ids.insert(tracked.track_id);
+      }
+    }
+    assert_eq!(
+      ids.len(),
+      1,
+      "distance matching must hold one id, got {ids:?}"
+    );
+  }
+
+  #[test]
+  fn same_jumps_defeat_iou_matching() {
+    let mut t = ObjectTracker::new(ObjectTrackerConfig {
+      hit_counter_max: 3,
+      initialization_delay: 1,
+      ..Default::default()
+    });
+
+    let mut confirmed = 0;
+    for frame in 0..5 {
+      let x = 0.05 + frame as f32 * 0.18;
+      let res = t.update(
+        vec![det(x, 0.30, 0.12, 0.35, "person")],
+        frame as f64 * 1000.0,
+        None,
+        None,
+      );
+      confirmed += res.tracked.len();
+    }
+    assert_eq!(
+      confirmed, 0,
+      "zero-IoU jumps must never confirm under IoU matching (guards the test above)"
     );
   }
 

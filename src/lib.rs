@@ -145,6 +145,9 @@ pub struct ObjectTrackerOptions {
   /// Cosine distance threshold for appearance ReID; only used when a frame
   /// buffer is passed to `update()`. Default 0.4.
   pub reid_embedding_threshold: Option<f64>,
+  /// Mean corner distance threshold in normalized units. When set, matching
+  /// tolerates movement beyond IoU overlap (slow detectors). Default: disabled.
+  pub motion_tolerance: Option<f64>,
 }
 
 fn to_internal(d: Detection) -> crate::types::Detection {
@@ -324,6 +327,9 @@ impl ObjectTracker {
       }
       if let Some(t) = opts.reid_embedding_threshold {
         config.reid_embedding_threshold = t;
+      }
+      if let Some(t) = opts.motion_tolerance {
+        config.motion_tolerance = if t > 0.0 { Some(t as f32) } else { None };
       }
     }
     Self {
