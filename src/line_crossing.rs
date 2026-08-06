@@ -1,7 +1,3 @@
-//! Line-crossing detection. The crossing line is perpendicular to the handle
-//! segment the user draws; crossings are detected by the cross-product sign of
-//! a track's prev->curr segment against the line.
-
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +27,6 @@ pub struct DetectionLineInput {
 pub struct PreparedLine {
   pub name: String,
   pub direction: LineDirectionFilter,
-  /// Lowercased labels; empty set means all allowed.
   pub labels: HashSet<String>,
   pub line_a: [f32; 2],
   pub line_b: [f32; 2],
@@ -49,7 +44,6 @@ pub struct LineCrossingEvent {
   pub curr_pos: [f32; 2],
 }
 
-/// Build prepared lines from UI input. `aspect_ratio` is the camera `width / height`.
 pub fn prepare_lines(lines: &[DetectionLineInput], aspect_ratio: f32) -> Vec<PreparedLine> {
   lines
     .iter()
@@ -62,8 +56,6 @@ pub fn prepare_lines(lines: &[DetectionLineInput], aspect_ratio: f32) -> Vec<Pre
       let mid_x = (h1x + h2x) * 0.5;
       let mid_y = (h1y + h2y) * 0.5;
 
-      // Perpendicular is computed in visual (aspect-corrected) space, then
-      // scaled back to normalized space so it looks perpendicular to the user.
       let dx_vis = (h2x - h1x) * aspect_ratio;
       let dy_vis = h2y - h1y;
       let perp_x_vis = -dy_vis;
@@ -97,8 +89,6 @@ pub fn prepare_lines(lines: &[DetectionLineInput], aspect_ratio: f32) -> Vec<Pre
     .collect()
 }
 
-/// Intersect track segment `(a,b)` with line `(c,d)`. Returns the signed cross
-/// product (positive A->B, negative B->A), or 0 if disjoint or parallel.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn segment_intersection(

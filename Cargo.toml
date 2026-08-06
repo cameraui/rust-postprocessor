@@ -4,20 +4,26 @@ name = "cameraui-rust-postprocessor"
 version = "0.0.0"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+replay = ["dep:serde", "dep:serde_json", "napi/noop", "napi-derive/noop"]
+
+[[bin]]
+name = "replay"
+required-features = ["replay"]
+
+[[test]]
+name = "replay"
+required-features = ["replay"]
 
 [dependencies]
 napi = { version = "3.12.0", default-features = false, features = ["napi9"] }
 napi-derive = "3.6.2"
-
-# Tracker engine — Rust port of the Python `norfair` library used by Frigate.
-# Same battle-tested algorithm: Kalman filter, IoU/Euclidean distance, ReID lifecycle.
-norfair-rs = { path = "./externals/norfair-rs", default-features = false }
-
-# Stable nalgebra for the few places we construct DMatrix ourselves
-nalgebra = "0.35.0"
-
-# SIMD primitives for our NMS implementation (f32x8 = 8 floats parallel).
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+trackforge = { path = "./externals/trackforge", default-features = false }
 wide = "1.6.0"
 
 [build-dependencies]

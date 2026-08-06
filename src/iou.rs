@@ -1,5 +1,3 @@
-//! IoU helpers. Boxes are normalized `[x, y, width, height]` in `[0.0, 1.0]`.
-
 #[inline]
 pub fn box_iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
   let ax2 = a[0] + a[2];

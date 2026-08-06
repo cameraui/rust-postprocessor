@@ -1,13 +1,12 @@
-//! NMS, IoU and object tracking exposed to Node.js via napi-rs.
-//! All coordinates are normalized to `[0.0, 1.0]`.
-
-mod embedding;
 mod iou;
 mod line_crossing;
 mod merge;
 mod nms;
-mod tracker;
+#[cfg(feature = "replay")]
+pub mod replay;
+pub mod semantic;
 mod types;
+pub mod world;
 mod zone_filter;
 
 use napi_derive::napi;
@@ -16,7 +15,6 @@ use crate::line_crossing::{
   CrossingDirection as InnerCrossingDirection, DetectionLineInput as InnerDetectionLineInput,
   LineDirectionFilter as InnerLineDirectionFilter,
 };
-use crate::tracker::{ObjectTracker as InnerObjectTracker, ObjectTrackerConfig};
 use crate::zone_filter::{
   ZoneFilterMode as InnerZoneFilterMode, ZoneInput as InnerZoneInput,
   ZoneMatchType as InnerZoneMatchType,
@@ -33,24 +31,6 @@ pub struct Detection {
 }
 
 #[napi(object)]
-pub struct TrackedDetection {
-  pub x: f64,
-  pub y: f64,
-  pub width: f64,
-  pub height: f64,
-  pub confidence: f64,
-  pub label: String,
-  pub track_id: u32,
-  pub track_age: u32,
-  /// True when the box is kept alive by Kalman extrapolation, not a fresh match.
-  pub track_lost: bool,
-  /// `sqrt(vx² + vy²)` in normalized units per frame; 0 with only one sample.
-  pub track_speed: f64,
-  pub track_velocity_x: f64,
-  pub track_velocity_y: f64,
-}
-
-#[napi(object)]
 pub struct BoundingBox {
   pub x: f64,
   pub y: f64,
@@ -58,8 +38,6 @@ pub struct BoundingBox {
   pub height: f64,
 }
 
-/// Camera ego-motion for one frame step in normalized coords; when supplied
-/// to `update()`, Kalman predictions are transformed to survive pans.
 #[napi(object)]
 pub struct CameraMotion {
   pub x: f64,
@@ -74,18 +52,14 @@ pub enum ZoneFilterMode {
 
 #[napi(string_enum = "kebab-case")]
 pub enum ZoneMatchType {
-  /// Any overlap with the polygon counts.
   Intersect,
-  /// All four corners must be inside the polygon.
   Contain,
 }
 
-/// `points` are polygon vertices in `[0, 100]` UI coordinates; auto-closed.
 #[napi(object)]
 pub struct DetectionZone {
   pub labels: Vec<String>,
   pub filter: ZoneFilterMode,
-  /// Mapped to `type` on the JS side of the SDK.
   pub match_type: ZoneMatchType,
   pub is_privacy_mask: bool,
   pub points: Vec<Vec<f64>>,
@@ -98,8 +72,6 @@ pub enum LineDirection {
   BToA,
 }
 
-/// `points` are the two handle endpoints in `[0, 100]` UI coordinates;
-/// empty `labels` means "any label".
 #[napi(object)]
 pub struct DetectionLine {
   pub name: String,
@@ -120,34 +92,6 @@ pub struct LineCrossingEvent {
   pub prev_y: f64,
   pub curr_x: f64,
   pub curr_y: f64,
-}
-
-#[napi(object)]
-pub struct UpdateResult {
-  pub tracked: Vec<TrackedDetection>,
-  pub crossings: Vec<LineCrossingEvent>,
-  /// Track ids that got their permanent id this frame.
-  pub created: Vec<u32>,
-  /// Track ids the tracker dropped this frame (hit counter exhausted).
-  pub removed: Vec<u32>,
-}
-
-#[napi(object)]
-pub struct ObjectTrackerOptions {
-  /// Default 0.3.
-  pub iou_threshold: Option<f64>,
-  /// Frames a track survives without a fresh detection. Default 15.
-  pub hit_counter_max: Option<i32>,
-  /// Frames a new track must be matched before getting a permanent id. Default 3.
-  pub initialization_delay: Option<i32>,
-  /// Frames a dead track stays available for ReID re-matching. Default: disabled.
-  pub reid_hit_counter_max: Option<i32>,
-  /// Cosine distance threshold for appearance ReID; only used when a frame
-  /// buffer is passed to `update()`. Default 0.4.
-  pub reid_embedding_threshold: Option<f64>,
-  /// Mean corner distance threshold in normalized units. When set, matching
-  /// tolerates movement beyond IoU overlap (slow detectors). Default: disabled.
-  pub motion_tolerance: Option<f64>,
 }
 
 fn to_internal(d: Detection) -> crate::types::Detection {
@@ -235,25 +179,21 @@ fn detection_line_to_internal(line: DetectionLine) -> Option<InnerDetectionLineI
   })
 }
 
-fn from_internal_tracked(d: crate::types::TrackedDetection) -> TrackedDetection {
-  TrackedDetection {
-    x: d.x as f64,
-    y: d.y as f64,
-    width: d.width as f64,
-    height: d.height as f64,
-    confidence: d.confidence as f64,
-    label: d.label,
-    track_id: d.track_id,
-    track_age: d.track_age,
-    track_lost: d.track_lost,
-    track_speed: d.track_speed as f64,
-    track_velocity_x: d.track_velocity_x as f64,
-    track_velocity_y: d.track_velocity_y as f64,
+fn crossing_from_internal(c: crate::line_crossing::LineCrossingEvent) -> LineCrossingEvent {
+  LineCrossingEvent {
+    line_name: c.line_name,
+    direction: line_direction_from_internal(c.direction),
+    track_id: c.track_id,
+    label: c.label,
+    confidence: c.confidence as f64,
+    timestamp_ms: c.timestamp_ms,
+    prev_x: c.prev_pos[0] as f64,
+    prev_y: c.prev_pos[1] as f64,
+    curr_x: c.curr_pos[0] as f64,
+    curr_y: c.curr_pos[1] as f64,
   }
 }
 
-/// Greedy NMS, suppressing only against higher-confidence boxes of the same
-/// `label`. Output sorted by confidence descending.
 #[napi]
 pub fn nms(
   detections: Vec<Detection>,
@@ -266,8 +206,6 @@ pub fn nms(
   kept.into_iter().map(from_internal).collect()
 }
 
-/// Like [`nms`] but returns the surviving input indices, so callers can keep
-/// extra fields that the Detection round-trip would drop.
 #[napi(js_name = "nmsIndices")]
 pub fn nms_indices(detections: Vec<Detection>, iou_threshold: f64) -> Vec<u32> {
   let internal: Vec<crate::types::Detection> = detections.into_iter().map(to_internal).collect();
@@ -277,9 +215,6 @@ pub fn nms_indices(detections: Vec<Detection>, iou_threshold: f64) -> Vec<u32> {
     .collect()
 }
 
-/// Cluster nearby/overlapping same-label detections into union boxes. Boxes
-/// join when their top-left corners are within `closeThreshold` on both axes
-/// or their IoU exceeds `iouThreshold`; the cluster keeps the max confidence.
 #[napi]
 pub fn merge(
   detections: Vec<Detection>,
@@ -292,7 +227,6 @@ pub fn merge(
   merged.into_iter().map(from_internal).collect()
 }
 
-/// IoU between two normalized `[x, y, width, height]` boxes.
 #[napi(js_name = "boxIou")]
 pub fn box_iou(a: BoundingBox, b: BoundingBox) -> f64 {
   let aa = [a.x as f32, a.y as f32, a.width as f32, a.height as f32];
@@ -300,161 +234,153 @@ pub fn box_iou(a: BoundingBox, b: BoundingBox) -> f64 {
   crate::iou::box_iou(&aa, &bb) as f64
 }
 
-/// Multi-class IoU + Kalman tracker (norfair-rs, one sub-tracker per label).
-/// Track ids are stable and globally unique; feed normalized coordinates.
-#[napi]
-pub struct ObjectTracker {
-  inner: InnerObjectTracker,
+#[napi(object)]
+pub struct WorldObject {
+  pub track_id: u32,
+  pub label: String,
+  pub x: f64,
+  pub y: f64,
+  pub width: f64,
+  pub height: f64,
+  pub confidence: f64,
+  pub speed: f64,
+  pub velocity_x: f64,
+  pub velocity_y: f64,
+  /// One of: tentative, active, stationary, lost, departed.
+  pub state: String,
+}
+
+#[napi(object)]
+pub struct WorldEvent {
+  /// One of: objectEntered, objectLost, objectRecovered, objectSettled,
+  /// objectWoke, objectDeparted, bestShotUpdated.
+  pub event_type: String,
+  pub object: WorldObject,
+}
+
+#[napi(object)]
+pub struct WorldIngestResult {
+  pub tracked: Vec<WorldObject>,
+  pub created: Vec<u32>,
+  pub removed: Vec<u32>,
+  pub events: Vec<WorldEvent>,
+  pub crossings: Vec<LineCrossingEvent>,
+}
+
+fn world_object(s: &crate::semantic::TrackSnapshot) -> WorldObject {
+  WorldObject {
+    track_id: s.track_id,
+    label: s.label.clone(),
+    x: s.x as f64,
+    y: s.y as f64,
+    width: s.width as f64,
+    height: s.height as f64,
+    confidence: s.confidence as f64,
+    speed: s.speed as f64,
+    velocity_x: s.velocity_x as f64,
+    velocity_y: s.velocity_y as f64,
+    state: match s.state {
+      crate::semantic::TrackState::Tentative => "tentative",
+      crate::semantic::TrackState::Active => "active",
+      crate::semantic::TrackState::Stationary => "stationary",
+      crate::semantic::TrackState::Lost => "lost",
+      crate::semantic::TrackState::Departed => "departed",
+    }
+    .to_string(),
+  }
+}
+
+fn world_event(e: &crate::semantic::SemanticEvent) -> WorldEvent {
+  use crate::semantic::SemanticEvent as E;
+  let snapshot = match e {
+    E::ObjectEntered(s)
+    | E::ObjectLost(s)
+    | E::ObjectRecovered(s)
+    | E::ObjectSettled(s)
+    | E::ObjectWoke(s)
+    | E::ObjectDeparted(s)
+    | E::BestShotUpdated(s) => s,
+  };
+  WorldEvent {
+    event_type: e.kind().to_string(),
+    object: world_object(snapshot),
+  }
 }
 
 #[napi]
-impl ObjectTracker {
+pub struct CameraWorld {
+  inner: crate::world::CameraWorld,
+}
+
+impl Default for CameraWorld {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+#[napi]
+impl CameraWorld {
   #[napi(constructor)]
-  pub fn new(options: Option<ObjectTrackerOptions>) -> Self {
-    let mut config = ObjectTrackerConfig::default();
-    if let Some(opts) = options {
-      if let Some(t) = opts.iou_threshold {
-        config.iou_threshold = t as f32;
-      }
-      if let Some(h) = opts.hit_counter_max {
-        config.hit_counter_max = h;
-      }
-      if let Some(i) = opts.initialization_delay {
-        config.initialization_delay = i;
-      }
-      if let Some(r) = opts.reid_hit_counter_max {
-        config.reid_hit_counter_max = if r > 0 { Some(r) } else { None };
-      }
-      if let Some(t) = opts.reid_embedding_threshold {
-        config.reid_embedding_threshold = t;
-      }
-      if let Some(t) = opts.motion_tolerance {
-        config.motion_tolerance = if t > 0.0 { Some(t as f32) } else { None };
-      }
-    }
+  pub fn new() -> Self {
     Self {
-      inner: InnerObjectTracker::new(config),
+      inner: crate::world::CameraWorld::new(crate::world::WorldConfig::default()),
     }
   }
 
-  /// Process one frame's detections and return active tracks plus any
-  /// crossing events. `timestampMs` is forwarded onto crossing events.
-  /// `cameraMotion` (optional) stabilizes Kalman predictions across pans.
   #[napi]
-  pub fn update(
+  pub fn ingest(
     &mut self,
-    detections: Vec<Detection>,
     timestamp_ms: f64,
-    frame: Option<napi::bindgen_prelude::Buffer>,
-    frame_width: Option<u32>,
-    frame_height: Option<u32>,
+    detections: Vec<Detection>,
     camera_motion: Option<CameraMotion>,
-  ) -> UpdateResult {
+  ) -> WorldIngestResult {
     let internal: Vec<crate::types::Detection> = detections.into_iter().map(to_internal).collect();
-    let frame_ref = match (&frame, frame_width, frame_height) {
-      (Some(buf), Some(w), Some(h)) => Some((buf.as_ref(), w, h)),
-      _ => None,
-    };
-    let motion = camera_motion.map(|m| crate::types::CameraMotion { x: m.x, y: m.y });
-    let result = self.inner.update(internal, timestamp_ms, frame_ref, motion);
-    UpdateResult {
-      tracked: result
-        .tracked
-        .into_iter()
-        .map(from_internal_tracked)
-        .collect(),
-      crossings: result
+    let motion = camera_motion.map(|m| (m.x as f32, m.y as f32));
+    let update = self.inner.ingest(timestamp_ms, &internal, motion);
+    WorldIngestResult {
+      tracked: update.tracked.iter().map(world_object).collect(),
+      created: update.created,
+      removed: update.removed,
+      events: update.events.iter().map(world_event).collect(),
+      crossings: update
         .crossings
         .into_iter()
-        .map(|c| LineCrossingEvent {
-          line_name: c.line_name,
-          direction: line_direction_from_internal(c.direction),
-          track_id: c.track_id,
-          label: c.label,
-          confidence: c.confidence as f64,
-          timestamp_ms: c.timestamp_ms,
-          prev_x: c.prev_pos[0] as f64,
-          prev_y: c.prev_pos[1] as f64,
-          curr_x: c.curr_pos[0] as f64,
-          curr_y: c.curr_pos[1] as f64,
-        })
+        .map(crossing_from_internal)
         .collect(),
-      created: result.created,
-      removed: result.removed,
     }
   }
 
-  /// Replace the configured crossing lines (empty array disables them).
-  /// `aspectRatio` is `width / height` so the line renders perpendicular to
-  /// the drawn handle. Crossing memory is cleared on every call.
   #[napi]
   pub fn set_lines(&mut self, lines: Vec<DetectionLine>, aspect_ratio: f64) {
-    let internal: Vec<InnerDetectionLineInput> = lines
+    let internal: Vec<_> = lines
       .into_iter()
       .filter_map(detection_line_to_internal)
       .collect();
     self.inner.set_lines(internal, aspect_ratio as f32);
   }
 
-  /// Replace the configured detection zones (empty array disables filtering).
-  /// Coordinates are in `[0, 100]` UI space; normalized and auto-closed
-  /// internally. Applied at the start of every `update()`.
+  #[napi]
+  pub fn notify_camera_move(&mut self) {
+    self.inner.notify_camera_move();
+  }
+
   #[napi]
   pub fn set_zones(&mut self, zones: Vec<DetectionZone>) {
-    let internal: Vec<InnerZoneInput> = zones
+    let internal: Vec<_> = zones
       .into_iter()
       .filter_map(detection_zone_to_internal)
       .collect();
     self.inner.set_zones(internal);
   }
 
-  /// Drop detections below this score at the start of every `update()`,
-  /// before zone filtering or tracking. Default 0.0 (no threshold).
   #[napi]
   pub fn set_min_confidence(&mut self, min_confidence: f64) {
     self.inner.set_min_confidence(min_confidence as f32);
   }
 
-  /// How many frames a dead track stays available for ReID re-matching;
-  /// the old id is preserved on merge. Pass 0 to disable.
-  #[napi]
-  pub fn set_reid_hit_counter_max(&mut self, frames: i32) {
-    self.inner.set_reid_hit_counter_max(frames);
-  }
-
-  /// Refresh the ReID counter for all dead tracks back to max. Call each
-  /// frame while a cascade is active so dead tracks don't expire mid-window.
-  #[napi]
-  pub fn refresh_reid(&mut self) {
-    self.inner.refresh_reid();
-  }
-
-  /// Apply zones + confidence threshold without advancing tracker state,
-  /// returning the surviving input indices. Used by the external-sensor-write
-  /// path that needs zone filtering without running the full tracker.
   #[napi]
   pub fn filter_indices(&self, detections: Vec<Detection>) -> Vec<u32> {
     let internal: Vec<crate::types::Detection> = detections.into_iter().map(to_internal).collect();
     self.inner.filter_indices(&internal)
-  }
-
-  /// Drop every active track; the next `update()` restarts ids from 1.
-  #[napi]
-  pub fn reset(&mut self) {
-    self.inner.reset();
-  }
-
-  /// Drop everything except the established tracks with the given ids and
-  /// return the ids that actually survived. Lets the caller keep its
-  /// known-stationary tracks (e.g. parked cars) across events so they can
-  /// stay suppressed.
-  #[napi]
-  pub fn retain_tracks(&mut self, track_ids: Vec<u32>) -> Vec<u32> {
-    self.inner.retain_tracks(&track_ids)
-  }
-
-  #[napi(getter)]
-  pub fn track_count(&self) -> u32 {
-    self.inner.track_count() as u32
   }
 }

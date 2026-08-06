@@ -700,7 +700,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
-module.exports.ObjectTracker = nativeBinding.ObjectTracker
+module.exports.CameraWorld = nativeBinding.CameraWorld
 module.exports.boxIou = nativeBinding.boxIou
 module.exports.LineDirection = nativeBinding.LineDirection
 module.exports.merge = nativeBinding.merge

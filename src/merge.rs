@@ -1,11 +1,7 @@
-//! Merges clusters of nearby/overlapping same-label detections into union boxes.
-//! Unlike NMS (which discards rivals), this collapses split detections of one object.
-
 use std::collections::HashMap;
 
 use crate::types::Detection;
 
-/// Merge nearby/overlapping same-label detections via union-find clustering.
 pub fn merge_detections(
   detections: Vec<Detection>,
   iou_threshold: f32,
@@ -15,7 +11,6 @@ pub fn merge_detections(
     return Vec::new();
   }
 
-  // Fast path: skip HashMap grouping when everything shares one label.
   let all_same_label = detections.windows(2).all(|w| w[0].label == w[1].label);
 
   let mut result: Vec<Detection> = Vec::with_capacity(detections.len());
@@ -64,7 +59,6 @@ fn merge_cluster(
     return;
   }
 
-  // SoA layout [x1, y1, x2, y2, area] per detection for cache-friendly compares.
   let mut boxes = vec![0.0f32; n * 5];
   for (i, &orig_idx) in indices.iter().enumerate() {
     let det = &detections[orig_idx];
@@ -265,7 +259,6 @@ mod tests {
 
   #[test]
   fn three_box_chain() {
-    // a-b and b-c overlap but a-c don't; union-find chains all three.
     let input = vec![
       det(0.10, 0.10, 0.10, 0.10, 0.5, "person"),
       det(0.15, 0.15, 0.10, 0.10, 0.6, "person"),

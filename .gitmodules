@@ -1,3 +1,6 @@
 [submodule "externals/norfair-rs"]
 	path = externals/norfair-rs
 	url = https://github.com/seydx/norfair-rs
+[submodule "externals/trackforge"]
+	path = externals/trackforge
+	url = https://github.com/seydx/trackforge

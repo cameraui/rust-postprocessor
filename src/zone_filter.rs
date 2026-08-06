@@ -1,5 +1,3 @@
-//! Detection zone filter. Zones are stored normalized to `[0.0, 1.0]`.
-
 use std::collections::HashSet;
 
 use crate::types::Detection;
@@ -7,7 +5,6 @@ use crate::types::Detection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneMatchType {
   Intersect,
-  /// All four corners of the box must be inside the zone.
   Contain,
 }
 
@@ -19,12 +16,10 @@ pub enum ZoneFilterMode {
 
 #[derive(Debug, Clone)]
 pub struct ZoneInput {
-  /// Empty means "all labels".
   pub labels: Vec<String>,
   pub filter: ZoneFilterMode,
   pub match_type: ZoneMatchType,
   pub is_privacy_mask: bool,
-  /// Polygon vertices in `[0, 100]` UI coordinates, not necessarily closed.
   pub points: Vec<[f64; 2]>,
 }
 
@@ -33,7 +28,6 @@ pub struct PreparedZone {
   pub labels: HashSet<String>,
   pub filter: ZoneFilterMode,
   pub match_type: ZoneMatchType,
-  /// Closed polygon in normalized `[0.0, 1.0]` coordinates.
   pub points: Vec<[f32; 2]>,
 }
 
@@ -41,8 +35,6 @@ pub struct PreparedZone {
 pub struct PreparedZones {
   pub privacy_masks: Vec<PreparedZone>,
   pub active_zones: Vec<PreparedZone>,
-  /// Union of every active zone's allowed labels (lowercased). Empty means
-  /// no per-zone label restriction is in effect.
   pub all_labels: HashSet<String>,
 }
 
@@ -96,8 +88,6 @@ pub fn prepare_zones(zones: &[ZoneInput]) -> PreparedZones {
   }
 }
 
-/// Ray-cast point-in-polygon, with an extra check for points lying exactly
-/// on an edge. Polygon must be closed.
 fn is_point_in_polygon(px: f32, py: f32, polygon: &[[f32; 2]]) -> bool {
   if polygon.len() < 3 {
     return false;
@@ -111,7 +101,6 @@ fn is_point_in_polygon(px: f32, py: f32, polygon: &[[f32; 2]]) -> bool {
     let xj = polygon[j][0];
     let yj = polygon[j][1];
 
-    // Point exactly on (or very near) the edge.
     let min_x = xi.min(xj);
     let max_x = xi.max(xj);
     let min_y = yi.min(yj);
@@ -208,7 +197,6 @@ fn zone_accepts_label(zone: &PreparedZone, lc_label: &str) -> bool {
   zone.labels.is_empty() || zone.labels.contains(lc_label)
 }
 
-/// Returns the indices of detections that pass the confidence + zone filter.
 pub fn filter_indices(
   detections: &[Detection],
   zones: &PreparedZones,
@@ -255,8 +243,6 @@ pub fn filter_indices(
         continue;
       }
       let intersects = box_intersects_polygon(det, &zone.points);
-      // `intersect` triggers on any overlap, `contain` only when the box is
-      // fully inside — the same rule for include and exclude zones.
       let in_zone = match zone.match_type {
         ZoneMatchType::Intersect => intersects,
         ZoneMatchType::Contain => intersects && box_contained_in_polygon(det, &zone.points),
@@ -467,8 +453,6 @@ mod tests {
 
   #[test]
   fn label_filter_restricts_globally() {
-    // Zone for cars only: persons dropped even outside it (union of zone
-    // labels is a global allow-list).
     let zones = prepare_zones(&[rect_zone(
       0.0,
       0.0,
@@ -574,8 +558,6 @@ mod tests {
 
   #[test]
   fn hof_zone_near_top_boundary_inside() {
-    // Edge (75,20)→(82,13) interpolates to y≈0.17 at x=0.78; the bbox sits
-    // fully below it so all four corners are inside.
     let zones = prepare_zones(&[hof_zone()]);
     let near_boundary = det(0.78, 0.20, 0.04, 0.07, "motion");
     let out = filter_detections(vec![near_boundary], &zones, 0.0);
@@ -588,7 +570,6 @@ mod tests {
 
   #[test]
   fn hof_zone_left_edge_outside() {
-    // Left boundary at x=0 starts at y=0.39; this bbox's top is at y=0.30.
     let zones = prepare_zones(&[hof_zone()]);
     let left_top = det(0.0, 0.30, 0.05, 0.05, "motion");
     let out = filter_detections(vec![left_top], &zones, 0.0);
@@ -625,8 +606,6 @@ mod tests {
 
   #[test]
   fn hof_zone_large_motion_bbox_filtered() {
-    // A full-frame motion bbox (e.g. a lighting change) is still filtered
-    // under Contain because its top corners are outside the zone.
     let zones = prepare_zones(&[hof_zone()]);
     let large = det(0.0, 0.0, 1.0, 1.0, "motion");
     let out = filter_detections(vec![large], &zones, 0.0);

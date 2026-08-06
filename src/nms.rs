@@ -1,11 +1,7 @@
-//! Greedy per-class NMS. SoA layout lets the inner IoU loop process eight
-//! boxes at once via `wide::f32x8`. Output is sorted by confidence descending.
-
 use wide::f32x8;
 
 use crate::types::Detection;
 
-/// Returns indices into the original (pre-sort) input array.
 fn nms_core(
   detections: &[Detection],
   iou_threshold: f32,
@@ -17,8 +13,6 @@ fn nms_core(
 
   let n = detections.len();
   let max_det = max_detections.unwrap_or(n);
-
-  // Sort indices, not Detections, so we can map back to original positions.
   let mut order: Vec<usize> = (0..n).collect();
 
   let prefilter_cap = max_det.saturating_mul(10).max(64);
@@ -157,7 +151,6 @@ fn nms_core(
   keep_sorted.iter().map(|&si| order[si]).collect()
 }
 
-/// Surviving detections, sorted by confidence descending.
 pub fn nms(
   detections: Vec<Detection>,
   iou_threshold: f32,
@@ -167,7 +160,6 @@ pub fn nms(
   indices.into_iter().map(|i| detections[i].clone()).collect()
 }
 
-/// Indices of surviving detections, sorted by confidence descending.
 pub fn nms_indices(detections: &[Detection], iou_threshold: f32) -> Vec<usize> {
   nms_core(detections, iou_threshold, None)
 }
@@ -223,7 +215,6 @@ mod tests {
 
   #[test]
   fn many_overlapping_simd_path() {
-    // 20 near-identical boxes to exercise the f32x8 chunked loop.
     let mut input = Vec::new();
     for i in 0..20 {
       input.push(det(0.1, 0.1, 0.2, 0.2, 0.9 - i as f32 * 0.001, "person"));
