@@ -4,11 +4,9 @@ export declare class CameraWorld {
   constructor()
   ingest(timestampMs: number, detections: Array<Detection>, cameraMotion?: CameraMotion | undefined | null): WorldIngestResult
   setLines(lines: Array<DetectionLine>, aspectRatio: number): void
-  /** PTZ moved: identities and anchors are position-based and start over. */
   notifyCameraMove(): void
   setZones(zones: Array<DetectionZone>): void
   setMinConfidence(minConfidence: number): void
-  /** Indices of detections that pass zones and min confidence. */
   filterIndices(detections: Array<Detection>): Array<number>
 }
 
@@ -21,10 +19,6 @@ export interface BoundingBox {
 
 export declare function boxIou(a: BoundingBox, b: BoundingBox): number
 
-/**
- * Camera ego-motion for one frame step in normalized coords; when supplied
- * to `update()`, Kalman predictions are transformed to survive pans.
- */
 export interface CameraMotion {
   x: number
   y: number
@@ -39,10 +33,6 @@ export interface Detection {
   label: string
 }
 
-/**
- * `points` are the two handle endpoints in `[0, 100]` UI coordinates;
- * empty `labels` means "any label".
- */
 export interface DetectionLine {
   name: string
   direction: LineDirection
@@ -50,11 +40,9 @@ export interface DetectionLine {
   points: Array<Array<number>>
 }
 
-/** `points` are polygon vertices in `[0, 100]` UI coordinates; auto-closed. */
 export interface DetectionZone {
   labels: Array<string>
   filter: ZoneFilterMode
-  /** Mapped to `type` on the JS side of the SDK. */
   matchType: ZoneMatchType
   isPrivacyMask: boolean
   points: Array<Array<number>>
@@ -96,9 +84,7 @@ export interface WorldEvent {
 
 export interface WorldIngestResult {
   tracked: Array<WorldObject>
-  /** World ids that got a new identity this tick (re-associations excluded). */
   created: Array<number>
-  /** World ids that departed this tick. */
   removed: Array<number>
   events: Array<WorldEvent>
   crossings: Array<LineCrossingEvent>
@@ -125,8 +111,6 @@ export declare const enum ZoneFilterMode {
 }
 
 export declare const enum ZoneMatchType {
-  /** Any overlap with the polygon counts. */
   Intersect = 'intersect',
-  /** All four corners must be inside the polygon. */
   Contain = 'contain'
 }
