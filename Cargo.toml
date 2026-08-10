@@ -19,15 +19,15 @@ name = "replay"
 required-features = ["replay"]
 
 [dependencies]
-napi = { version = "3.12.0", default-features = false, features = ["napi9"] }
-napi-derive = "3.6.2"
+napi = { version = "3.12.1", default-features = false, features = ["napi9"] }
+napi-derive = "3.6.3"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 trackforge = { path = "./externals/trackforge", default-features = false }
-wide = "1.6.0"
+wide = "1.6.1"
 
 [build-dependencies]
-napi-build = "2.4.0"
+napi-build = "2.4.1"
 
 [profile.release]
 lto = true
