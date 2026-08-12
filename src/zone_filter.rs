@@ -35,13 +35,11 @@ pub struct PreparedZone {
 pub struct PreparedZones {
   pub privacy_masks: Vec<PreparedZone>,
   pub active_zones: Vec<PreparedZone>,
-  pub all_labels: HashSet<String>,
 }
 
 pub fn prepare_zones(zones: &[ZoneInput]) -> PreparedZones {
   let mut privacy_masks = Vec::new();
   let mut active_zones = Vec::new();
-  let mut all_labels: HashSet<String> = HashSet::new();
 
   for zone in zones {
     let mut points: Vec<[f32; 2]> = zone
@@ -58,14 +56,7 @@ pub fn prepare_zones(zones: &[ZoneInput]) -> PreparedZones {
       }
     }
 
-    let mut labels: HashSet<String> = HashSet::new();
-    for label in &zone.labels {
-      let lc = label.to_lowercase();
-      labels.insert(lc.clone());
-      if !zone.is_privacy_mask {
-        all_labels.insert(lc);
-      }
-    }
+    let labels: HashSet<String> = zone.labels.iter().map(|l| l.to_lowercase()).collect();
 
     let prepared = PreparedZone {
       labels,
@@ -84,7 +75,6 @@ pub fn prepare_zones(zones: &[ZoneInput]) -> PreparedZones {
   PreparedZones {
     privacy_masks,
     active_zones,
-    all_labels,
   }
 }
 
@@ -205,7 +195,6 @@ pub fn filter_indices(
   let PreparedZones {
     privacy_masks,
     active_zones,
-    all_labels,
   } = zones;
 
   let mut out: Vec<u32> = Vec::with_capacity(detections.len());
@@ -219,10 +208,9 @@ pub fn filter_indices(
       continue;
     }
 
+    // a zone only governs its selected labels: a label no zone selects
+    // passes unconstrained (privacy masks stay label-agnostic)
     let label_lc = det.label.to_lowercase();
-    if !all_labels.is_empty() && !all_labels.contains(&label_lc) {
-      continue;
-    }
 
     let mut dropped = false;
     for mask in privacy_masks {
@@ -452,21 +440,22 @@ mod tests {
   }
 
   #[test]
-  fn label_filter_restricts_globally() {
+  fn unselected_label_passes_unconstrained() {
     let zones = prepare_zones(&[rect_zone(
       0.0,
       0.0,
-      100.0,
+      50.0,
       100.0,
       ZoneFilterMode::Include,
       ZoneMatchType::Intersect,
       vec!["car".to_string()],
     )]);
-    let person = det(0.30, 0.30, 0.20, 0.20, "person");
-    let car = det(0.30, 0.30, 0.20, 0.20, "car");
+    // both outside the zone: the include zone governs car only
+    let person = det(0.70, 0.30, 0.20, 0.20, "person");
+    let car = det(0.70, 0.30, 0.20, 0.20, "car");
     let out = filter_detections(vec![person, car], &zones, 0.0);
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].label, "car");
+    assert_eq!(out[0].label, "person");
   }
 
   #[test]
@@ -475,14 +464,14 @@ mod tests {
       rect_zone(
         0.0,
         0.0,
-        100.0,
+        50.0,
         100.0,
         ZoneFilterMode::Include,
         ZoneMatchType::Intersect,
         vec!["person".to_string()],
       ),
       rect_zone(
-        0.0,
+        50.0,
         0.0,
         100.0,
         100.0,
@@ -491,11 +480,81 @@ mod tests {
         vec!["car".to_string()],
       ),
     ]);
-    let person = det(0.30, 0.30, 0.20, 0.20, "person");
-    let car = det(0.30, 0.30, 0.20, 0.20, "car");
-    let cat = det(0.30, 0.30, 0.20, 0.20, "cat");
+    // left half: person zone accepts, car zone ignores car here
+    let person = det(0.10, 0.30, 0.20, 0.20, "person");
+    let car = det(0.10, 0.30, 0.20, 0.20, "car");
+    // cat is selected in no zone and passes everywhere
+    let cat = det(0.10, 0.30, 0.20, 0.20, "cat");
     let out = filter_detections(vec![person, car, cat], &zones, 0.0);
     assert_eq!(out.len(), 2);
+    assert!(out.iter().any(|d| d.label == "person"));
+    assert!(out.iter().any(|d| d.label == "cat"));
+  }
+
+  #[test]
+  fn exclude_zone_governs_only_its_labels() {
+    let zones = prepare_zones(&[rect_zone(
+      0.0,
+      0.0,
+      100.0,
+      100.0,
+      ZoneFilterMode::Exclude,
+      ZoneMatchType::Intersect,
+      vec!["car".to_string()],
+    )]);
+    let person = det(0.30, 0.30, 0.20, 0.20, "person");
+    let car = det(0.30, 0.30, 0.20, 0.20, "car");
+    let out = filter_detections(vec![person, car], &zones, 0.0);
+    assert_eq!(out.len(), 1, "exclude must not drop unselected labels");
+    assert_eq!(out[0].label, "person");
+  }
+
+  #[test]
+  fn unlabeled_zone_combined_with_labeled_zone() {
+    let zones = prepare_zones(&[
+      rect_zone(
+        0.0,
+        0.0,
+        50.0,
+        100.0,
+        ZoneFilterMode::Include,
+        ZoneMatchType::Intersect,
+        vec![],
+      ),
+      rect_zone(
+        50.0,
+        0.0,
+        100.0,
+        100.0,
+        ZoneFilterMode::Include,
+        ZoneMatchType::Intersect,
+        vec!["car".to_string()],
+      ),
+    ]);
+    // the unlabeled zone accepts every label, so motion in it must survive
+    let motion_left = det(0.10, 0.30, 0.20, 0.20, "motion");
+    let motion_right = det(0.70, 0.30, 0.20, 0.20, "motion");
+    let out = filter_detections(vec![motion_left, motion_right], &zones, 0.0);
+    assert_eq!(out.len(), 1);
+    assert!((out[0].x - 0.10).abs() < 1e-6);
+  }
+
+  #[test]
+  fn full_frame_box_passes_when_label_unselected() {
+    // camera-side motion sensors report full-frame boxes; deselecting motion
+    // in every zone must let them through untouched
+    let zones = prepare_zones(&[rect_zone(
+      25.0,
+      25.0,
+      75.0,
+      75.0,
+      ZoneFilterMode::Include,
+      ZoneMatchType::Contain,
+      vec!["person".to_string()],
+    )]);
+    let motion = det(0.0, 0.0, 1.0, 1.0, "motion");
+    let out = filter_detections(vec![motion], &zones, 0.0);
+    assert_eq!(out.len(), 1);
   }
 
   fn hof_zone() -> ZoneInput {
