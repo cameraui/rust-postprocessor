@@ -274,7 +274,12 @@ fn filter_detections(
   zones: &PreparedZones,
   min_confidence: f32,
 ) -> Vec<Detection> {
-  let indices = filter_indices(&detections, zones, min_confidence, &std::collections::HashMap::new());
+  let indices = filter_indices(
+    &detections,
+    zones,
+    min_confidence,
+    &std::collections::HashMap::new(),
+  );
   if indices.len() == detections.len() {
     return detections;
   }

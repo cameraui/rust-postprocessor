@@ -127,7 +127,10 @@ impl CameraWorld {
   }
 
   pub fn set_min_confidences(&mut self, by_label: HashMap<String, f32>) {
-    self.min_confidence_by_label = by_label.into_iter().map(|(k, v)| (k.to_lowercase(), v.max(0.0))).collect();
+    self.min_confidence_by_label = by_label
+      .into_iter()
+      .map(|(k, v)| (k.to_lowercase(), v.max(0.0)))
+      .collect();
   }
 
   pub fn min_confidence_for(&self, label: &str) -> f32 {
@@ -139,7 +142,12 @@ impl CameraWorld {
   }
 
   pub fn filter_indices(&self, detections: &[Detection]) -> Vec<u32> {
-    filter_indices(detections, &self.prepared_zones, self.min_confidence, &self.min_confidence_by_label)
+    filter_indices(
+      detections,
+      &self.prepared_zones,
+      self.min_confidence,
+      &self.min_confidence_by_label,
+    )
   }
 
   pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, aspect_ratio: f32) {
@@ -203,7 +211,12 @@ impl CameraWorld {
     // the engine gets everything down to the association floor — ByteTrack's
     // second pass continues established tracks through low-confidence
     // stretches; the user threshold gates track BIRTH below, not association
-    let kept = filter_indices(detections, &self.prepared_zones, ASSOCIATION_FLOOR, &HashMap::new());
+    let kept = filter_indices(
+      detections,
+      &self.prepared_zones,
+      ASSOCIATION_FLOOR,
+      &HashMap::new(),
+    );
     let detections: Vec<&Detection> = kept.iter().map(|&i| &detections[i as usize]).collect();
 
     let detections: Vec<([f32; 4], f32, i64)> = detections
