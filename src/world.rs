@@ -15,6 +15,7 @@ use crate::zone_filter::{filter_indices, prepare_zones, PreparedZones, ZoneInput
 type TrackSegment = (u32, String, (f32, f32), (f32, f32));
 
 const ASSOCIATION_FLOOR: f32 = 0.1;
+const ORPHAN_MS: f64 = 1_500.0;
 
 pub struct WorldUpdate {
   pub tracked: Vec<TrackSnapshot>,
@@ -27,6 +28,7 @@ pub struct WorldUpdate {
 pub struct WorldConfig {
   pub gap_reset_ms: f64,
   pub depart_grace_ms: f64,
+  pub still_lost_grace_ms: f64,
   pub settle_default_ms: f64,
   pub settle_vehicle_ms: f64,
   pub settle_person_ms: f64,
@@ -42,9 +44,12 @@ impl Default for WorldConfig {
     Self {
       gap_reset_ms: 5_000.0,
       depart_grace_ms: 5_000.0,
+      still_lost_grace_ms: 60_000.0,
       settle_default_ms: 10_000.0,
       settle_vehicle_ms: 8_000.0,
-      settle_person_ms: 120_000.0,
+      // swept 2026-08-17 over live traces: 60s matches 120s on premature
+      // settles but halves how long spans stay open; 30s doubles the noise
+      settle_person_ms: 60_000.0,
       stationary_speed: 0.002,
       reassoc_iou: 0.3,
       wake_ticks: 3,
@@ -59,6 +64,8 @@ struct WorldTrack {
   bbox: [f32; 4],
   // last box while stationary; a stolen engine box must not drag the anchor
   anchor: [f32; 4],
+  // box at confirmation, net travel since then separates leavers from sitters
+  origin: [f32; 4],
   confidence: f32,
   speed: f32,
   velocity: (f32, f32),
@@ -69,6 +76,8 @@ struct WorldTrack {
   first_seen_ms: f64,
   best_shot_score: f32,
   dormant: bool,
+  slow_confirm: bool,
+  wake_dist: f32,
 }
 
 pub struct CameraWorld {
@@ -201,6 +210,7 @@ impl CameraWorld {
 
     let mut seen: Vec<u32> = Vec::new();
     let mut segments: Vec<TrackSegment> = Vec::new();
+    let tick_detections = detections.clone();
     for t in self.engine.update(detections) {
       if !t.is_activated {
         continue;
@@ -211,16 +221,74 @@ impl CameraWorld {
       };
       let bbox = t.tlwh;
 
+      // a same-class passer-by steals a stationary track's engine identity the
+      // moment their boxes overlap and drags it along. Two signatures: some
+      // detection still sits on the anchor (the sitter is visible), or the box
+      // teleported — a parked object beginning to move travels a fraction of
+      // its own size per tick, a steal jumps to wherever the passer is. Either
+      // way unbind the engine id: the passer enters as its own identity next
+      // tick and the sitter re-associates back onto its anchor
+      if let Some(&world_id) = self.engine_map.get(&engine_id) {
+        if let Some(track) = self.tracks.get(&world_id) {
+          if track.state == TrackState::Stationary && box_iou(&track.anchor, &bbox) < 0.15 {
+            let label_id = self.label_ids.get(&track.label).copied();
+            let anchor_held = tick_detections.iter().any(|(dbox, _, dlabel)| {
+              Some(*dlabel) == label_id && box_iou(dbox, &track.anchor) >= 0.3
+            });
+            let teleported = {
+              let (px, py) = (
+                track.bbox[0] + track.bbox[2] / 2.0,
+                track.bbox[1] + track.bbox[3] / 2.0,
+              );
+              let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
+              let reach = track.anchor[2].max(track.anchor[3]);
+              ((bx - px).powi(2) + (by - py).powi(2)).sqrt() > reach * 0.5
+            };
+            if anchor_held || teleported {
+              self.engine_map.remove(&engine_id);
+              continue;
+            }
+          }
+        }
+      }
+
       let world_id = match self.engine_map.get(&engine_id) {
         Some(id) if self.tracks.contains_key(id) => *id,
         _ => {
           // dormant resume is continuation and allowed at any score; a NEW
           // identity needs the user threshold at least once
-          let reassociated = self.reassociate(&label, &bbox);
+          let reassociated = self.reassociate(&label, &bbox, t_ms, &tick_detections);
           if reassociated.is_none() && t.score < self.min_confidence {
             continue;
           }
+          // a second engine track overlapping a live, freshly-seen world track
+          // of the same label is another view of the same body, not a newcomer;
+          // a real second person separates and gets their identity then
+          if reassociated.is_none() && self.duplicates_live_track(&label, &bbox, t_ms) {
+            continue;
+          }
+          // overlapping a known track of ANOTHER label smells like a
+          // misclassification flicker (a sitting person read as a vehicle for a
+          // second); such a birth must persist longer before it confirms —
+          // a real rider (person + bicycle stacked) passes that bar easily
+          let slow_confirm =
+            reassociated.is_none() && self.contradicts_other_label(&label, &bbox, t_ms);
           let id = reassociated.unwrap_or_else(|| {
+            #[cfg(feature = "replay")]
+            if std::env::var("WORLD_DEBUG_BIRTH").is_ok() {
+              eprintln!("BIRTH t={} label={} bbox={:?}", t_ms, label, bbox);
+              for (tid, tr) in &self.tracks {
+                if tr.label == label {
+                  eprintln!(
+                    "  cand #{tid} dormant={} unseen={}ms bbox={:?} anchor={:?}",
+                    tr.dormant,
+                    (t_ms - tr.last_seen_ms) as i64,
+                    tr.bbox,
+                    tr.anchor
+                  );
+                }
+              }
+            }
             let id = self.next_id;
             self.next_id += 1;
             self.tracks.insert(
@@ -229,6 +297,7 @@ impl CameraWorld {
                 label: label.clone(),
                 bbox,
                 anchor: bbox,
+                origin: bbox,
                 confidence: t.score,
                 speed: 0.0,
                 velocity: (0.0, 0.0),
@@ -239,6 +308,8 @@ impl CameraWorld {
                 first_seen_ms: t_ms,
                 best_shot_score: 0.0,
                 dormant: false,
+                slow_confirm,
+                wake_dist: 0.0,
               },
             );
             id
@@ -254,6 +325,11 @@ impl CameraWorld {
       if track.state == TrackState::Tentative {
         // an identity is persistence over time, independent of tick rate: a
         // single flicker never re-sights after the window and dies silently
+        let confirm_ms = if track.slow_confirm {
+          confirm_ms * 4.0
+        } else {
+          confirm_ms
+        };
         if t_ms - track.first_seen_ms < confirm_ms {
           track.bbox = bbox;
           track.anchor = bbox;
@@ -263,6 +339,7 @@ impl CameraWorld {
           continue;
         }
         track.state = TrackState::Active;
+        track.origin = track.bbox;
         created.push(world_id);
         events.push(SemanticEvent::ObjectEntered(snapshot(world_id, track)));
       }
@@ -302,30 +379,49 @@ impl CameraWorld {
       let moving = track.speed >= self.config.stationary_speed;
       if track.state == TrackState::Stationary {
         let anchor_iou = box_iou(&track.anchor, &bbox);
-        // waking needs the box to have left the anchor, not merely deformed:
-        // an occluder shifting the visible box must not wake a parked object
-        let departed_anchor = anchor_iou < 0.15;
-        if moving && departed_anchor {
+        // waking needs the center to have left the anchor's reach, not merely a
+        // deformed or swapped box view: an occluder or a torso-vs-legs detector
+        // flap must not wake a parked object. The reach comes from the anchor
+        // alone: the current box of someone standing up fills half the frame
+        // and must not raise the bar for their own wake
+        let anchor_dist = {
+          let (ax, ay) = (
+            track.anchor[0] + track.anchor[2] / 2.0,
+            track.anchor[1] + track.anchor[3] / 2.0,
+          );
+          let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
+          ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
+        };
+        let reach = track.anchor[2].max(track.anchor[3]);
+        let departed_anchor = anchor_iou < 0.15 && anchor_dist > reach * 0.5;
+        // real departure keeps gaining distance tick over tick; a detector view
+        // swap jumps once and then holds still, and must not wake anything
+        let traveling = anchor_dist > track.wake_dist + 0.005;
+        if moving && departed_anchor && traveling {
+          track.wake_dist = anchor_dist;
           track.moving_streak += 1;
           if track.moving_streak >= self.config.wake_ticks {
             track.state = TrackState::Active;
             track.still_since_ms = t_ms;
             track.moving_streak = 0;
+            track.wake_dist = 0.0;
             events.push(SemanticEvent::ObjectWoke(snapshot(world_id, track)));
           }
         } else {
           track.moving_streak = 0;
+          track.wake_dist = 0.0;
           // drift correction only at rest, so a departing box can't drag the anchor along
           if !moving && anchor_iou >= 0.6 {
             track.anchor = bbox;
           }
         }
       } else {
-        // stillness is position truth, not velocity noise: the box of a still
-        // object keeps overlapping its anchor (IoU-relative, so box size and
-        // jitter scale out); anything actually going somewhere re-anchors
-        // constantly and never accumulates still time
-        if box_iou(&track.anchor, &bbox) < 0.6 {
+        // stillness is position truth, not velocity noise: the still clock only
+        // resets when the box center leaves the anchor (or overlap collapses).
+        // A partial detection of the same object (torso-only vs full body at a
+        // frame edge, window-seam size flap) keeps its center inside the anchor
+        // and must not restart the clock
+        if box_iou(&track.anchor, &bbox) < 0.3 || !center_inside(&bbox, &track.anchor) {
           track.anchor = bbox;
           track.still_since_ms = t_ms;
         }
@@ -357,11 +453,46 @@ impl CameraWorld {
         return true;
       }
       if t_ms - track.last_seen_ms > depart_grace_ms {
-        // only something that was going somewhere can leave; a still object
-        // (anchor held at least as long as the leaver grace) sleeps instead
-        let was_still = track.still_since_ms == track.first_seen_ms
-          || track.last_seen_ms - track.still_since_ms >= depart_grace_ms;
+        // only something that went somewhere can leave; a still object sleeps.
+        // Three still signals, each robust against a failure mode of the others:
+        // anchor hold (classic), EMA speed (box-flap immune), and net travel
+        // from the confirmation spot (a walk-in that sat down is not a leaver)
+        let travel = {
+          let (ox, oy) = (
+            track.origin[0] + track.origin[2] / 2.0,
+            track.origin[1] + track.origin[3] / 2.0,
+          );
+          let (bx, by) = (
+            track.bbox[0] + track.bbox[2] / 2.0,
+            track.bbox[1] + track.bbox[3] / 2.0,
+          );
+          ((bx - ox).powi(2) + (by - oy).powi(2)).sqrt()
+        };
+        let reach = {
+          let diag = |b: &[f32; 4]| (b[2].powi(2) + b[3].powi(2)).sqrt();
+          diag(&track.origin).max(diag(&track.bbox))
+        };
+        // a leaver's box gets clipped at the frame border, pinning the center
+        // and collapsing the EMA speed right before it vanishes: whoever
+        // traveled far AND faded at an edge has left, whatever the final speed
+        let at_edge = track.bbox[0] <= 0.01
+          || track.bbox[1] <= 0.01
+          || track.bbox[0] + track.bbox[2] >= 0.99
+          || track.bbox[1] + track.bbox[3] >= 0.99;
+        let traveled_out = track.state != TrackState::Stationary && at_edge && travel >= reach;
+        let was_still = !traveled_out
+          && (track.still_since_ms == track.first_seen_ms
+            || track.last_seen_ms - track.still_since_ms >= depart_grace_ms
+            || track.speed < self.config.stationary_speed * 2.0
+            || travel < reach);
         if was_still || track.state == TrackState::Stationary {
+          // a still object that fades mid-frame is still there, the detector
+          // just missed it; hold visibility through the longer still grace so
+          // a re-sighting is silent continuation instead of a lost/recovered
+          // cycle that reopens spans
+          if t_ms - track.last_seen_ms <= self.config.still_lost_grace_ms {
+            return true;
+          }
           track.dormant = true;
           track.moving_streak = 0;
           // the span consumer needs the silent sleep too: a track fading out
@@ -470,18 +601,107 @@ impl CameraWorld {
     events
   }
 
-  fn reassociate(&self, label: &str, bbox: &[f32; 4]) -> Option<u32> {
+  fn reassociate(
+    &self,
+    label: &str,
+    bbox: &[f32; 4],
+    t_ms: f64,
+    tick_detections: &[([f32; 4], f32, i64)],
+  ) -> Option<u32> {
+    let label_id = self.label_ids.get(label).copied();
     let mut best: Option<(u32, f32)> = None;
     for (id, track) in &self.tracks {
-      if !track.dormant || track.label != label {
+      // dormant tracks, plus orphans the engine already forgot while the world
+      // grace still runs; a freshly-seen track keeps its identity to itself
+      let orphaned = t_ms - track.last_seen_ms > ORPHAN_MS;
+      if (!track.dormant && !orphaned) || track.label != label {
         continue;
       }
-      let iou = box_iou(&track.anchor, bbox);
-      if iou >= self.config.reassoc_iou && best.is_none_or(|(_, b)| iou > b) {
-        best = Some((*id, iou));
+      // a settled identity belongs to whoever claims its anchor best: a car
+      // entering over a dormant parked spot must not resume the parker's
+      // identity while the parker itself still sits on the anchor. Only for
+      // stationary sleepers (an active sleeper has no sitter to protect), and
+      // only against overlap-tier claims — the near tier below exists exactly
+      // for same-body view flips, where a competing part-detection is expected
+      let own_claim = box_iou(&track.anchor, bbox);
+      let contested = track.state == TrackState::Stationary
+        && own_claim >= 0.1
+        && tick_detections.iter().any(|(dbox, _, dlabel)| {
+          Some(*dlabel) == label_id
+            && dbox != bbox
+            && box_iou(dbox, &track.anchor) > own_claim.max(0.3)
+        });
+      if contested {
+        continue;
+      }
+      // match against the anchor AND the last box, best of both: the anchor can
+      // be stale (the standing box of someone who since sat down) while the
+      // last box carries the freshest evidence
+      for reference in [&track.anchor, &track.bbox] {
+        let iou = box_iou(reference, bbox);
+        // a partial re-sighting (head-only vs full body) fails IoU but keeps one
+        // center inside the other; the size guard only blocks depth confusion
+        // (near vs far person, ~50x apart), body fragments run up to ~5x
+        let area = bbox[2] * bbox[3];
+        let reference_area = reference[2] * reference[3];
+        let size_ok = area <= reference_area * 8.0 && reference_area <= area * 8.0;
+        let contained =
+          size_ok && (center_inside(bbox, reference) || center_inside(reference, bbox));
+        // last resort for detector output flapping between two views of one body
+        // (torso-only vs legs-only): centers within half the larger reach still
+        // count, two neighboring parked cars sit a full width apart and stay out
+        let near = size_ok && {
+          let (ax, ay) = (
+            reference[0] + reference[2] / 2.0,
+            reference[1] + reference[3] / 2.0,
+          );
+          let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
+          let reach = reference[2].max(reference[3]).max(bbox[2].max(bbox[3]));
+          ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() <= reach * 0.5
+        };
+        let score = if iou >= self.config.reassoc_iou {
+          1.0 + iou
+        } else if contained {
+          iou
+        } else if near {
+          iou * 0.5
+        } else {
+          continue;
+        };
+        if best.is_none_or(|(_, b)| score > b) {
+          best = Some((*id, score));
+        }
       }
     }
     best.map(|(id, _)| id)
+  }
+
+  fn duplicates_live_track(&self, label: &str, bbox: &[f32; 4], t_ms: f64) -> bool {
+    // no size guard here: a body fragment is naturally many times smaller than
+    // the full box, and suppressing a birth costs nothing lasting — a real
+    // second person separates and enters a moment later
+    self.tracks.values().any(|track| {
+      if track.dormant || track.label != label || t_ms - track.last_seen_ms > ORPHAN_MS {
+        return false;
+      }
+      box_iou(&track.bbox, bbox) >= self.config.reassoc_iou
+        || center_inside(bbox, &track.bbox)
+        || center_inside(&track.bbox, bbox)
+    })
+  }
+
+  fn contradicts_other_label(&self, label: &str, bbox: &[f32; 4], t_ms: f64) -> bool {
+    self.tracks.values().any(|track| {
+      if track.dormant || track.label == label {
+        return false;
+      }
+      let position_stable = track.state == TrackState::Stationary
+        || t_ms - track.last_seen_ms <= self.config.depart_grace_ms;
+      position_stable
+        && (box_iou(&track.bbox, bbox) >= self.config.reassoc_iou
+          || center_inside(bbox, &track.bbox)
+          || center_inside(&track.bbox, bbox))
+    })
   }
 
   fn settle_ms(&self, label: &str) -> f64 {
@@ -506,6 +726,12 @@ impl CameraWorld {
       };
     }
   }
+}
+
+fn center_inside(of: &[f32; 4], within: &[f32; 4]) -> bool {
+  let cx = of[0] + of[2] / 2.0;
+  let cy = of[1] + of[3] / 2.0;
+  cx >= within[0] && cx <= within[0] + within[2] && cy >= within[1] && cy <= within[1] + within[3]
 }
 
 fn maybe_best_shot(world_id: u32, track: &mut WorldTrack, events: &mut Vec<SemanticEvent>) {
@@ -612,11 +838,37 @@ mod tests {
         .count();
       departed += up.removed.len();
     }
-    // never seen moving: fades into sleep, not a departure
+    // a still object that fades mid-frame is held through the still grace
+    assert_eq!(lost, 0);
+    assert_eq!(departed, 0);
+
+    let up = world.ingest(11_000.0, &[person(0.5)], None);
+    assert!(up.created.is_empty(), "resume keeps the identity");
+    assert_eq!(
+      up.events
+        .iter()
+        .filter(|e| e.kind() == "objectRecovered")
+        .count(),
+      0,
+      "a re-sighting within the still grace is silent continuation"
+    );
+
+    let mut lost = 0;
+    let mut departed = 0;
+    for i in 1..=350 {
+      let up = world.ingest(11_000.0 + i as f64 * 200.0, &[], None);
+      lost += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectLost")
+        .count();
+      departed += up.removed.len();
+    }
+    // never seen moving: past the still grace it sleeps, not departs
     assert_eq!(lost, 1);
     assert_eq!(departed, 0);
 
-    let up = world.ingest(12_000.0, &[person(0.5)], None);
+    let up = world.ingest(11_000.0 + 351.0 * 200.0, &[person(0.5)], None);
     assert!(up.created.is_empty(), "resume keeps the identity");
     assert_eq!(
       up.events

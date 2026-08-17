@@ -104,7 +104,15 @@ pub fn run_world(ticks: &[ReplayTick], keep_events: bool) -> ReplaySummary {
 }
 
 pub fn run_world_items(items: &[ReplayItem], keep_events: bool) -> ReplaySummary {
-  let mut world = crate::world::CameraWorld::new(crate::world::WorldConfig::default());
+  run_world_items_with(items, keep_events, crate::world::WorldConfig::default())
+}
+
+pub fn run_world_items_with(
+  items: &[ReplayItem],
+  keep_events: bool,
+  world_config: crate::world::WorldConfig,
+) -> ReplaySummary {
+  let mut world = crate::world::CameraWorld::new(world_config);
   let mut aspect: f32 = 16.0 / 9.0;
   run_steps(
     items,
