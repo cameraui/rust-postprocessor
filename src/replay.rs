@@ -49,6 +49,7 @@ pub struct ReplayLine {
 pub struct ReplayConfig {
   pub zones: Option<Vec<ReplayZone>>,
   pub min_confidence: Option<f32>,
+  pub min_confidences: Option<std::collections::HashMap<String, f32>>,
   pub lines: Option<Vec<ReplayLine>>,
   pub aspect_ratio: Option<f32>,
 }
@@ -158,6 +159,12 @@ fn apply_config(world: &mut crate::world::CameraWorld, config: &ReplayConfig, as
   }
   if let Some(min) = config.min_confidence {
     world.set_min_confidence(min);
+  }
+  if let Some(by_label) = &config.min_confidences {
+    if let Some(min) = by_label.values().copied().reduce(f32::min) {
+      world.set_min_confidence(min);
+    }
+    world.set_min_confidences(by_label.clone());
   }
   if let Some(lines) = &config.lines {
     world.set_lines(lines.iter().filter_map(to_line_input).collect(), *aspect);

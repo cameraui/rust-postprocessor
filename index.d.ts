@@ -7,6 +7,7 @@ export declare class CameraWorld {
   notifyCameraMove(): void
   setZones(zones: Array<DetectionZone>): void
   setMinConfidence(minConfidence: number): void
+  setMinConfidences(byLabel: Record<string, number>): void
   filterIndices(detections: Array<Detection>): Array<number>
 }
 
@@ -103,6 +104,8 @@ export interface WorldObject {
   velocityY: number
   /** One of: tentative, active, stationary, lost, departed. */
   state: string
+  /** Epoch ms since the object has been still; only set while state is stationary. */
+  stationarySinceMs?: number
 }
 
 export declare const enum ZoneFilterMode {

@@ -191,6 +191,7 @@ pub fn filter_indices(
   detections: &[Detection],
   zones: &PreparedZones,
   min_confidence: f32,
+  min_confidence_by_label: &std::collections::HashMap<String, f32>,
 ) -> Vec<u32> {
   let PreparedZones {
     privacy_masks,
@@ -199,7 +200,11 @@ pub fn filter_indices(
 
   let mut out: Vec<u32> = Vec::with_capacity(detections.len());
   for (i, det) in detections.iter().enumerate() {
-    if det.confidence < min_confidence {
+    let min = min_confidence_by_label
+      .get(&det.label.to_lowercase())
+      .copied()
+      .unwrap_or(min_confidence);
+    if det.confidence < min {
       continue;
     }
 
@@ -269,7 +274,7 @@ fn filter_detections(
   zones: &PreparedZones,
   min_confidence: f32,
 ) -> Vec<Detection> {
-  let indices = filter_indices(&detections, zones, min_confidence);
+  let indices = filter_indices(&detections, zones, min_confidence, &std::collections::HashMap::new());
   if indices.len() == detections.len() {
     return detections;
   }

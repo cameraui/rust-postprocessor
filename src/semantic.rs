@@ -24,6 +24,8 @@ pub struct TrackSnapshot {
   pub velocity_x: f32,
   pub velocity_y: f32,
   pub state: TrackState,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub stationary_since_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

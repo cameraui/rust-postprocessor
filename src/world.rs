@@ -91,6 +91,7 @@ pub struct CameraWorld {
   crossing_memory: HashSet<(u32, u32)>,
   prepared_zones: PreparedZones,
   min_confidence: f32,
+  min_confidence_by_label: HashMap<String, f32>,
   // class ids live as long as the engine hands out tracks that carry them
   labels: Vec<String>,
   label_ids: HashMap<String, i64>,
@@ -110,6 +111,7 @@ impl CameraWorld {
       crossing_memory: HashSet::new(),
       prepared_zones: PreparedZones::default(),
       min_confidence: 0.0,
+      min_confidence_by_label: HashMap::new(),
       labels: Vec::new(),
       label_ids: HashMap::new(),
       pose_baseline: None,
@@ -124,8 +126,20 @@ impl CameraWorld {
     self.min_confidence = min_confidence.max(0.0);
   }
 
+  pub fn set_min_confidences(&mut self, by_label: HashMap<String, f32>) {
+    self.min_confidence_by_label = by_label.into_iter().map(|(k, v)| (k.to_lowercase(), v.max(0.0))).collect();
+  }
+
+  pub fn min_confidence_for(&self, label: &str) -> f32 {
+    self
+      .min_confidence_by_label
+      .get(&label.to_lowercase())
+      .copied()
+      .unwrap_or(self.min_confidence)
+  }
+
   pub fn filter_indices(&self, detections: &[Detection]) -> Vec<u32> {
-    filter_indices(detections, &self.prepared_zones, self.min_confidence)
+    filter_indices(detections, &self.prepared_zones, self.min_confidence, &self.min_confidence_by_label)
   }
 
   pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, aspect_ratio: f32) {
@@ -189,7 +203,7 @@ impl CameraWorld {
     // the engine gets everything down to the association floor — ByteTrack's
     // second pass continues established tracks through low-confidence
     // stretches; the user threshold gates track BIRTH below, not association
-    let kept = filter_indices(detections, &self.prepared_zones, ASSOCIATION_FLOOR);
+    let kept = filter_indices(detections, &self.prepared_zones, ASSOCIATION_FLOOR, &HashMap::new());
     let detections: Vec<&Detection> = kept.iter().map(|&i| &detections[i as usize]).collect();
 
     let detections: Vec<([f32; 4], f32, i64)> = detections
@@ -258,7 +272,7 @@ impl CameraWorld {
           // dormant resume is continuation and allowed at any score; a NEW
           // identity needs the user threshold at least once
           let reassociated = self.reassociate(&label, &bbox, t_ms, &tick_detections);
-          if reassociated.is_none() && t.score < self.min_confidence {
+          if reassociated.is_none() && t.score < self.min_confidence_for(&label) {
             continue;
           }
           // a second engine track overlapping a live, freshly-seen world track
@@ -762,6 +776,7 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     velocity_x: t.velocity.0,
     velocity_y: t.velocity.1,
     state: t.state,
+    stationary_since_ms: (t.state == TrackState::Stationary).then_some(t.still_since_ms),
   }
 }
 

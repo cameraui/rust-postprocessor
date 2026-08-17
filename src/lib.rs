@@ -248,6 +248,8 @@ pub struct WorldObject {
   pub velocity_y: f64,
   /// One of: tentative, active, stationary, lost, departed.
   pub state: String,
+  /// Epoch ms since the object has been still; only set while state is stationary.
+  pub stationary_since_ms: Option<f64>,
 }
 
 #[napi(object)]
@@ -287,6 +289,7 @@ fn world_object(s: &crate::semantic::TrackSnapshot) -> WorldObject {
       crate::semantic::TrackState::Departed => "departed",
     }
     .to_string(),
+    stationary_since_ms: s.stationary_since_ms,
   }
 }
 
@@ -376,6 +379,13 @@ impl CameraWorld {
   #[napi]
   pub fn set_min_confidence(&mut self, min_confidence: f64) {
     self.inner.set_min_confidence(min_confidence as f32);
+  }
+
+  #[napi]
+  pub fn set_min_confidences(&mut self, by_label: std::collections::HashMap<String, f64>) {
+    self
+      .inner
+      .set_min_confidences(by_label.into_iter().map(|(k, v)| (k, v as f32)).collect());
   }
 
   #[napi]
