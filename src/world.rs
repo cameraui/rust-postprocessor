@@ -150,8 +150,8 @@ impl CameraWorld {
     )
   }
 
-  pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, aspect_ratio: f32) {
-    self.prepared_lines = prepare_lines(&lines, aspect_ratio);
+  pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, _aspect_ratio: f32) {
+    self.prepared_lines = prepare_lines(&lines);
     self.crossing_memory.clear();
   }
 
@@ -583,19 +583,14 @@ impl CameraWorld {
           continue;
         }
         let cross = segment_intersection(
-          prev.0,
-          prev.1,
-          curr.0,
-          curr.1,
-          line.line_a[0],
-          line.line_a[1],
-          line.line_b[0],
-          line.line_b[1],
+          prev.0, prev.1, curr.0, curr.1, line.p1[0], line.p1[1], line.p2[0], line.p2[1],
         );
         if cross == 0.0 {
           continue;
         }
-        let direction = if cross > 0.0 {
+        // the editor labels the side at mid - rot90(p2 - p1) as A, so travel
+        // from A to B has a negative path x line cross product
+        let direction = if cross < 0.0 {
           CrossingDirection::AToB
         } else {
           CrossingDirection::BToA
@@ -798,9 +793,13 @@ mod tests {
   use super::*;
 
   fn person(x: f32) -> Detection {
+    person_at(x, 0.4)
+  }
+
+  fn person_at(x: f32, y: f32) -> Detection {
     Detection {
       x,
-      y: 0.4,
+      y,
       width: 0.1,
       height: 0.2,
       confidence: 0.9,
@@ -808,12 +807,13 @@ mod tests {
     }
   }
 
+  // drawn bottom to top, so the A side is the left half of the image
   fn vertical_line_at(x_ui: f64, name: &str) -> DetectionLineInput {
     DetectionLineInput {
       name: name.to_string(),
       direction: LineDirectionFilter::Both,
       labels: Vec::new(),
-      points: [[x_ui - 10.0, 50.0], [x_ui + 10.0, 50.0]],
+      points: [[x_ui, 80.0], [x_ui, 20.0]],
     }
   }
 
@@ -828,6 +828,55 @@ mod tests {
     }
     assert_eq!(crossings.len(), 1);
     assert_eq!(crossings[0].line_name, "gate");
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn crossing_the_drawn_line_fires_downward_as_a_to_b() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(
+      vec![DetectionLineInput {
+        name: "garden".to_string(),
+        direction: LineDirectionFilter::Both,
+        labels: Vec::new(),
+        points: [[7.0, 67.0], [50.0, 74.0]],
+      }],
+      1.0,
+    );
+    let mut crossings = Vec::new();
+    for i in 0..15 {
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[person_at(0.25, 0.45 + i as f32 * 0.03)],
+        None,
+      );
+      crossings.extend(update.crossings);
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn box_jitter_beside_the_line_never_crosses() {
+    // regression: a parked vehicle wobbling where the A/B direction arrow is
+    // rendered tripped the line it never touched
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(
+      vec![DetectionLineInput {
+        name: "garden".to_string(),
+        direction: LineDirectionFilter::Both,
+        labels: Vec::new(),
+        points: [[7.0, 67.0], [50.0, 74.0]],
+      }],
+      1.0,
+    );
+    let mut crossings = 0;
+    for i in 0..20 {
+      let x = if i % 2 == 0 { 0.25 } else { 0.27 };
+      let update = world.ingest(i as f64 * 200.0, &[person_at(x, 0.4)], None);
+      crossings += update.crossings.len();
+    }
+    assert_eq!(crossings, 0);
   }
 
   #[test]

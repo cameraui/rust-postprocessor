@@ -28,8 +28,8 @@ pub struct PreparedLine {
   pub name: String,
   pub direction: LineDirectionFilter,
   pub labels: HashSet<String>,
-  pub line_a: [f32; 2],
-  pub line_b: [f32; 2],
+  pub p1: [f32; 2],
+  pub p2: [f32; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -44,46 +44,24 @@ pub struct LineCrossingEvent {
   pub curr_pos: [f32; 2],
 }
 
-pub fn prepare_lines(lines: &[DetectionLineInput], aspect_ratio: f32) -> Vec<PreparedLine> {
+pub fn prepare_lines(lines: &[DetectionLineInput]) -> Vec<PreparedLine> {
   lines
     .iter()
     .map(|line| {
-      let h1x = (line.points[0][0] / 100.0) as f32;
-      let h1y = (line.points[0][1] / 100.0) as f32;
-      let h2x = (line.points[1][0] / 100.0) as f32;
-      let h2y = (line.points[1][1] / 100.0) as f32;
-
-      let mid_x = (h1x + h2x) * 0.5;
-      let mid_y = (h1y + h2y) * 0.5;
-
-      let dx_vis = (h2x - h1x) * aspect_ratio;
-      let dy_vis = h2y - h1y;
-      let perp_x_vis = -dy_vis;
-      let perp_y_vis = dx_vis;
-
-      let perp_x_norm = perp_x_vis / aspect_ratio;
-      let perp_y_norm = perp_y_vis;
-      let perp_len = (perp_x_norm * perp_x_norm + perp_y_norm * perp_y_norm)
-        .sqrt()
-        .max(1e-12);
-      let handle_len = ((h2x - h1x).powi(2) + (h2y - h1y).powi(2))
-        .sqrt()
-        .max(1e-12);
-      let scale = handle_len / perp_len;
-      let perp_x = perp_x_norm * scale;
-      let perp_y = perp_y_norm * scale;
-
-      let line_a = [mid_x - perp_x * 0.5, mid_y - perp_y * 0.5];
-      let line_b = [mid_x + perp_x * 0.5, mid_y + perp_y * 0.5];
-
       let labels: HashSet<String> = line.labels.iter().map(|l| l.to_lowercase()).collect();
 
       PreparedLine {
         name: line.name.clone(),
         direction: line.direction,
         labels,
-        line_a,
-        line_b,
+        p1: [
+          (line.points[0][0] / 100.0) as f32,
+          (line.points[0][1] / 100.0) as f32,
+        ],
+        p2: [
+          (line.points[1][0] / 100.0) as f32,
+          (line.points[1][1] / 100.0) as f32,
+        ],
       }
     })
     .collect()
@@ -134,12 +112,12 @@ mod tests {
   }
 
   #[test]
-  fn prepare_horizontal_handle_yields_vertical_line() {
-    let prepared = prepare_lines(&[line("h", [10.0, 50.0], [90.0, 50.0])], 16.0 / 9.0);
+  fn prepare_keeps_the_drawn_line() {
+    let prepared = prepare_lines(&[line("h", [10.0, 50.0], [90.0, 60.0])]);
     assert_eq!(prepared.len(), 1);
     let p = &prepared[0];
-    assert!((p.line_a[0] - p.line_b[0]).abs() < 1e-4);
-    assert!((p.line_a[0] - 0.5).abs() < 1e-4);
+    assert_eq!(p.p1, [0.1, 0.5]);
+    assert_eq!(p.p2, [0.9, 0.6]);
   }
 
   #[test]
