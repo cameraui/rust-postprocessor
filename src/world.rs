@@ -513,6 +513,15 @@ impl CameraWorld {
             || track.speed < self.config.stationary_speed * 2.0
             || travel < reach);
         if was_still || track.state == TrackState::Stationary {
+          // a track that faded without ever going anywhere is scenery caught
+          // in detector flickers, not a visitor: settle it the moment the hold
+          // starts, so its span closes now and re-sightings stay silent
+          // instead of stamping moving evidence for as long as the hold lasts
+          if track.state != TrackState::Stationary && travel < reach * 0.5 {
+            track.state = TrackState::Stationary;
+            track.anchor = track.bbox;
+            events.push(SemanticEvent::ObjectSettled(snapshot(*id, track)));
+          }
           // a still object that fades mid-frame is still there, the detector
           // just missed it; hold visibility through the longer still grace so
           // a re-sighting is silent continuation instead of a lost/recovered
@@ -857,6 +866,32 @@ mod tests {
   }
 
   #[test]
+  fn one_way_line_ignores_the_other_direction() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut line = vertical_line_at(50.0, "one-way");
+    line.direction = LineDirectionFilter::AToB;
+    world.set_lines(vec![line], 1.0);
+    // A is the left half: walking left is b-to-a and must stay silent
+    for i in 0..20 {
+      let update = world.ingest(i as f64 * 200.0, &[person(0.8 - i as f32 * 0.03)], None);
+      assert!(
+        update.crossings.is_empty(),
+        "b-to-a fired on an a-to-b line"
+      );
+    }
+    let mut fired = 0;
+    for i in 0..20 {
+      let update = world.ingest(
+        60_000.0 + i as f64 * 200.0,
+        &[person(0.2 + i as f32 * 0.03)],
+        None,
+      );
+      fired += update.crossings.len();
+    }
+    assert_eq!(fired, 1);
+  }
+
+  #[test]
   fn box_jitter_beside_the_line_never_crosses() {
     // regression: a parked vehicle wobbling where the A/B direction arrow is
     // rendered tripped the line it never touched
@@ -877,6 +912,112 @@ mod tests {
       crossings += update.crossings.len();
     }
     assert_eq!(crossings, 0);
+  }
+
+  #[test]
+  fn a_faded_newcomer_settles_instead_of_haunting() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    for i in 0..4 {
+      world.ingest(i as f64 * 200.0, &[person_at(0.3, 0.4)], None);
+    }
+    let mut settled = 0;
+    let mut lost = 0;
+    for i in 4..40 {
+      let up = world.ingest(i as f64 * 200.0, &[], None);
+      settled += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectSettled")
+        .count();
+      lost += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectLost")
+        .count();
+    }
+    assert_eq!(settled, 1, "the span must close when the hold starts");
+    assert_eq!(lost, 0, "the identity is held, not lost");
+
+    // the flicker returning must not read as an arrival
+    let up = world.ingest(8_200.0, &[person_at(0.3, 0.4)], None);
+    assert!(up.created.is_empty());
+    assert!(!up
+      .events
+      .iter()
+      .any(|e| matches!(e.kind(), "objectEntered" | "objectWoke" | "objectRecovered")));
+    assert!(up.tracked.iter().all(|t| t.state == TrackState::Stationary));
+  }
+
+  #[test]
+  fn an_occluded_traveler_keeps_its_hold() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // walks far enough to be a traveler, not far enough to have left
+    for i in 0..15 {
+      world.ingest(
+        i as f64 * 200.0,
+        &[person_at(0.30 + i as f32 * 0.015, 0.4)],
+        None,
+      );
+    }
+    for i in 15..65 {
+      let up = world.ingest(i as f64 * 200.0, &[], None);
+      assert!(
+        !up
+          .events
+          .iter()
+          .any(|e| matches!(e.kind(), "objectSettled" | "objectLost" | "objectDeparted")),
+        "an occluded traveler is neither scenery nor gone"
+      );
+    }
+  }
+
+  #[test]
+  fn sparse_parked_flickers_never_stamp_a_second_visit() {
+    // the Eingang phantom: a huge edge sliver seen for a moment, then again
+    // half a minute later, held an event open for a minute
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let sliver = || Detection {
+      x: 0.0,
+      y: 0.13,
+      width: 0.33,
+      height: 0.87,
+      confidence: 0.75,
+      label: "vehicle".to_string(),
+    };
+    let mut entered = 0;
+    let mut settled = 0;
+    for i in 0..4 {
+      let up = world.ingest(i as f64 * 200.0, &[sliver()], None);
+      entered += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectEntered")
+        .count();
+    }
+    for i in 4..40 {
+      let up = world.ingest(i as f64 * 200.0, &[], None);
+      settled += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectSettled")
+        .count();
+    }
+    assert_eq!(entered, 1);
+    assert_eq!(settled, 1);
+
+    // half a minute of silence crosses the decode-gap reset, so the identity
+    // sleeps; the resight may recover it, but only as stationary scenery
+    let up = world.ingest(30_000.0, &[sliver()], None);
+    assert!(up.created.is_empty());
+    for e in &up.events {
+      match e {
+        SemanticEvent::ObjectEntered(_) | SemanticEvent::ObjectWoke(_) => {
+          panic!("a parked flicker resight read as an arrival")
+        }
+        SemanticEvent::ObjectRecovered(s) => assert_eq!(s.state, TrackState::Stationary),
+        _ => {}
+      }
+    }
   }
 
   #[test]
