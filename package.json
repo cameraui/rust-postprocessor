@@ -35,11 +35,11 @@
     "release": "bash scripts/release.sh",
     "test": "cargo test --release",
     "universal": "napi universal",
-    "update": "updates --update ./",
+    "update": "updates -M npm,pypi,go,cargo,docker,make --update ./",
     "version": "napi version"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.8.6",
+    "@napi-rs/cli": "^3.9.0",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@typescript-eslint/parser": "^8.69.0",
     "concurrently": "^10.0.5",
@@ -52,7 +52,7 @@
     "sharp": "^0.35.4",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.69.0",
-    "updates": "^18.0.7"
+    "updates": "^18.1.0"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rust-postprocessor/issues"
