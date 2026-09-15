@@ -26,6 +26,10 @@ pub struct TrackSnapshot {
   pub state: TrackState,
   #[cfg_attr(feature = "replay", serde(default))]
   pub stationary_since_ms: Option<f64>,
+  // the sighting this snapshot describes; older than the tick when a track
+  // confirms without being seen again
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub last_seen_ms: f64,
 }
 
 #[derive(Debug, Clone)]

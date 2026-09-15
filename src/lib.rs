@@ -250,6 +250,9 @@ pub struct WorldObject {
   pub state: String,
   /// Epoch ms since the object has been still; only set while state is stationary.
   pub stationary_since_ms: Option<f64>,
+  /// Epoch ms of the sighting this object describes; older than the tick when a
+  /// track confirms through a witness without being seen again.
+  pub last_seen_ms: f64,
 }
 
 #[napi(object)]
@@ -267,6 +270,9 @@ pub struct WorldIngestResult {
   pub removed: Vec<u32>,
   pub events: Vec<WorldEvent>,
   pub crossings: Vec<LineCrossingEvent>,
+  /// Tracks first seen this tick and not confirmed yet. A witness may confirm
+  /// one after the object left the frame, so the host can keep its picture.
+  pub sightings: Vec<WorldObject>,
 }
 
 fn world_object(s: &crate::semantic::TrackSnapshot) -> WorldObject {
@@ -290,6 +296,7 @@ fn world_object(s: &crate::semantic::TrackSnapshot) -> WorldObject {
     }
     .to_string(),
     stationary_since_ms: s.stationary_since_ms,
+    last_seen_ms: s.last_seen_ms,
   }
 }
 
@@ -342,6 +349,7 @@ impl CameraWorld {
     let update = self.inner.ingest(timestamp_ms, &internal, motion);
     WorldIngestResult {
       tracked: update.tracked.iter().map(world_object).collect(),
+      sightings: update.sightings.iter().map(world_object).collect(),
       created: update.created,
       removed: update.removed,
       events: update.events.iter().map(world_event).collect(),
@@ -351,6 +359,13 @@ impl CameraWorld {
         .map(crossing_from_internal)
         .collect(),
     }
+  }
+
+  /// A detector outside the world (the camera's own AI) saw `label` at
+  /// `timestamp_ms`; lets a single sighting of ours confirm.
+  #[napi]
+  pub fn attest(&mut self, label: String, timestamp_ms: f64) {
+    self.inner.attest(&label, timestamp_ms);
   }
 
   #[napi]

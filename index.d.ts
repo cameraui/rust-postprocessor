@@ -12,6 +12,11 @@ export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-was
 export declare class CameraWorld {
   constructor()
   ingest(timestampMs: number, detections: Array<Detection>, cameraMotion?: CameraMotion | undefined | null): WorldIngestResult
+  /**
+   * A detector outside the world (the camera's own AI) saw `label` at
+   * `timestamp_ms`; lets a single sighting of ours confirm.
+   */
+  attest(label: string, timestampMs: number): void
   setLines(lines: Array<DetectionLine>, aspectRatio: number): void
   notifyCameraMove(): void
   setZones(zones: Array<DetectionZone>): void
@@ -98,6 +103,11 @@ export interface WorldIngestResult {
   removed: Array<number>
   events: Array<WorldEvent>
   crossings: Array<LineCrossingEvent>
+  /**
+   * Tracks first seen this tick and not confirmed yet. A witness may confirm
+   * one after the object left the frame, so the host can keep its picture.
+   */
+  sightings: Array<WorldObject>
 }
 
 export interface WorldObject {
@@ -115,6 +125,11 @@ export interface WorldObject {
   state: string
   /** Epoch ms since the object has been still; only set while state is stationary. */
   stationarySinceMs?: number
+  /**
+   * Epoch ms of the sighting this object describes; older than the tick when a
+   * track confirms through a witness without being seen again.
+   */
+  lastSeenMs: number
 }
 
 export declare const enum ZoneFilterMode {

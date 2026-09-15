@@ -16,6 +16,9 @@ type TrackSegment = (u32, String, (f32, f32), (f32, f32));
 
 const ASSOCIATION_FLOOR: f32 = 0.1;
 const ORPHAN_MS: f64 = 1_500.0;
+// a camera-side report and our own sighting have to fall this close together
+// to count as the same object
+const ATTEST_WINDOW_MS: f64 = 3_000.0;
 
 pub struct WorldUpdate {
   pub tracked: Vec<TrackSnapshot>,
@@ -23,6 +26,9 @@ pub struct WorldUpdate {
   pub removed: Vec<u32>,
   pub events: Vec<SemanticEvent>,
   pub crossings: Vec<LineCrossingEvent>,
+  // tracks first seen this tick, still unconfirmed: a witness may confirm them
+  // after the object is gone, so the host can keep their picture meanwhile
+  pub sightings: Vec<TrackSnapshot>,
 }
 
 pub struct WorldConfig {
@@ -104,6 +110,8 @@ pub struct CameraWorld {
   labels: Vec<String>,
   label_ids: HashMap<String, i64>,
   pose_baseline: Option<(f32, f32)>,
+  // label -> when a camera-side detector last reported it
+  attestations: HashMap<String, f64>,
 }
 
 impl CameraWorld {
@@ -123,7 +131,22 @@ impl CameraWorld {
       labels: Vec::new(),
       label_ids: HashMap::new(),
       pose_baseline: None,
+      attestations: HashMap::new(),
     }
+  }
+
+  /// A detector outside this world (the camera's own AI, an event feed) saw
+  /// `label` at `t_ms`. It never creates anything by itself: it lets a single
+  /// sighting of ours confirm without the persistence a flicker would fail.
+  pub fn attest(&mut self, label: &str, t_ms: f64) {
+    self.attestations.insert(label.to_string(), t_ms);
+  }
+
+  fn attested(&self, label: &str, t_ms: f64) -> bool {
+    self
+      .attestations
+      .get(label)
+      .is_some_and(|at| (t_ms - at).abs() <= ATTEST_WINDOW_MS)
   }
 
   pub fn set_zones(&mut self, zones: Vec<ZoneInput>) {
@@ -182,6 +205,7 @@ impl CameraWorld {
   ) -> WorldUpdate {
     let mut events = Vec::new();
     let mut created = Vec::new();
+    let mut sightings = Vec::new();
 
     if self.last_t_ms != 0.0 && t_ms - self.last_t_ms > self.config.gap_reset_ms {
       // a decode gap is not evidence anything left: engine restarts, world
@@ -334,6 +358,7 @@ impl CameraWorld {
             }
             let id = self.next_id;
             self.next_id += 1;
+            let born = id;
             self.tracks.insert(
               id,
               WorldTrack {
@@ -355,6 +380,7 @@ impl CameraWorld {
                 wake_dist: 0.0,
               },
             );
+            sightings.push(snapshot(born, &self.tracks[&born]));
             id
           });
           self.engine_map.insert(engine_id, id);
@@ -364,16 +390,18 @@ impl CameraWorld {
 
       let confirm_ms = self.config.confirm_ms;
       let settle_ms = self.settle_ms(&label);
+      let attested = self.attested(&label, t_ms);
       let track = self.tracks.get_mut(&world_id).unwrap();
       if track.state == TrackState::Tentative {
         // an identity is persistence over time, independent of tick rate: a
-        // single flicker never re-sights after the window and dies silently
+        // single flicker never re-sights after the window and dies silently.
+        // Two detectors agreeing is persistence enough
         let confirm_ms = if track.slow_confirm {
           confirm_ms * 4.0
         } else {
           confirm_ms
         };
-        if t_ms - track.first_seen_ms < confirm_ms {
+        if t_ms - track.first_seen_ms < confirm_ms && !attested {
           track.bbox = bbox;
           track.anchor = bbox;
           track.confidence = t.score;
@@ -483,11 +511,29 @@ impl CameraWorld {
     let mut removed = Vec::new();
     let mut removed_quiet = Vec::new();
     let depart_grace_ms = self.config.depart_grace_ms;
+    let attestations = &self.attestations;
+    // a track confirmed without being seen this tick: its sighting was
+    // withheld until now, so it is delivered with this tick, dated by
+    // last_seen_ms
+    let mut late_confirmed: Vec<TrackSnapshot> = Vec::new();
     self.tracks.retain(|id, track| {
       if seen.contains(id) || track.dormant {
         return true;
       }
       if track.state == TrackState::Tentative {
+        // the camera's report may land a tick after our only sighting: the
+        // sighting still confirms, with the box it left behind
+        let attested = attestations
+          .get(&track.label)
+          .is_some_and(|at| (at - track.last_seen_ms).abs() <= ATTEST_WINDOW_MS);
+        if attested {
+          track.state = TrackState::Active;
+          track.origin = track.bbox;
+          created.push(*id);
+          events.push(SemanticEvent::ObjectEntered(snapshot(*id, track)));
+          late_confirmed.push(snapshot(*id, track));
+          return true;
+        }
         // an unconfirmed flicker dies silently
         if t_ms - track.last_seen_ms > depart_grace_ms {
           removed_quiet.push(*id);
@@ -567,7 +613,7 @@ impl CameraWorld {
       self.crossing_memory.retain(|(id, _)| !removed.contains(id));
     }
 
-    let tracked = seen
+    let mut tracked: Vec<TrackSnapshot> = seen
       .iter()
       .filter_map(|id| {
         self
@@ -577,8 +623,10 @@ impl CameraWorld {
           .map(|t| snapshot(*id, t))
       })
       .collect();
+    tracked.extend(late_confirmed);
 
     WorldUpdate {
+      sightings,
       tracked,
       created,
       removed,
@@ -826,6 +874,7 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     velocity_y: t.velocity.1,
     state: t.state,
     stationary_since_ms: (t.state == TrackState::Stationary).then_some(t.still_since_ms),
+    last_seen_ms: t.last_seen_ms,
   }
 }
 
@@ -1340,5 +1389,106 @@ mod tests {
       entered, 1,
       "a person beside the sleeper is their own identity"
     );
+  }
+
+  #[test]
+  fn a_camera_report_lets_a_single_sighting_confirm() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // without a report a lone sighting never becomes anyone
+    world.ingest(0.0, &[person(0.3)], None);
+    for i in 1..30 {
+      let up = world.ingest(i as f64 * 200.0, &[], None);
+      assert!(up.created.is_empty() && up.events.is_empty());
+    }
+
+    // the camera saw a person too, a moment before our one frame
+    world.attest("person", 10_000.0);
+    let up = world.ingest(10_400.0, &[person(0.3)], None);
+    assert_eq!(
+      up.created.len(),
+      1,
+      "two detectors agreeing confirm at once"
+    );
+    assert!(up.events.iter().any(|e| e.kind() == "objectEntered"));
+  }
+
+  #[test]
+  fn a_report_landing_after_the_sighting_still_confirms() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.ingest(0.0, &[person(0.3)], None);
+    world.attest("person", 800.0);
+    let up = world.ingest(1_000.0, &[], None);
+    assert_eq!(up.created.len(), 1);
+    let entered = up.events.iter().find(|e| e.kind() == "objectEntered");
+    assert!(
+      entered.is_some(),
+      "the sighting confirms with the box it left"
+    );
+  }
+
+  #[test]
+  fn a_report_of_another_label_or_another_time_confirms_nothing() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.attest("vehicle", 0.0);
+    let up = world.ingest(100.0, &[person(0.3)], None);
+    assert!(
+      up.created.is_empty(),
+      "a vehicle report says nothing about a person"
+    );
+
+    world.attest("person", 100.0);
+    let up = world.ingest(20_000.0, &[person(0.6)], None);
+    assert!(
+      up.created.is_empty(),
+      "a report from long ago is no witness"
+    );
+    let up = world.ingest(20_200.0, &[], None);
+    assert!(up.created.is_empty());
+  }
+
+  #[test]
+  fn a_first_sighting_is_reported_before_it_confirms() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let up = world.ingest(0.0, &[person(0.3)], None);
+    assert_eq!(up.sightings.len(), 1);
+    assert_eq!(up.sightings[0].state, TrackState::Tentative);
+    assert!(up.tracked.is_empty() && up.created.is_empty());
+
+    let up = world.ingest(200.0, &[person(0.3)], None);
+    assert!(
+      up.sightings.is_empty(),
+      "only the first sighting is reported"
+    );
+    let up = world.ingest(600.0, &[person(0.3)], None);
+    assert_eq!(up.created.len(), 1);
+    assert_eq!(up.tracked[0].last_seen_ms, 600.0);
+  }
+
+  #[test]
+  fn a_late_witness_confirms_with_the_sighting_time() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.ingest(0.0, &[person(0.3)], None);
+    world.attest("person", 800.0);
+    let up = world.ingest(1_000.0, &[], None);
+    let entered = up
+      .events
+      .iter()
+      .find_map(|e| match e {
+        SemanticEvent::ObjectEntered(s) => Some(s),
+        _ => None,
+      })
+      .expect("the sighting confirms");
+    assert_eq!(
+      entered.last_seen_ms, 0.0,
+      "the snapshot names the sighting, not the tick"
+    );
+    assert_eq!(
+      up.tracked.len(),
+      1,
+      "the withheld sighting is delivered with this tick"
+    );
+    assert_eq!(up.tracked[0].last_seen_ms, 0.0);
+    let up = world.ingest(1_200.0, &[], None);
+    assert!(up.tracked.is_empty(), "delivered once, not every tick");
   }
 }
