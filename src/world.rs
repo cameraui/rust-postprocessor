@@ -412,6 +412,12 @@ impl CameraWorld {
       if was_dormant {
         track.speed = 0.0;
         track.velocity = (0.0, 0.0);
+        // time unseen says nothing about a person standing still: a walker who
+        // comes back restarts the still clock instead of settling on arrival.
+        // A vehicle that drove in and is seen again on the same spot has parked
+        if track.state != TrackState::Stationary && animate(&track.label) {
+          track.still_since_ms = t_ms;
+        }
       } else {
         // EMA over signed components so detector box jitter cancels out
         // instead of reading as perpetual movement; speed is the magnitude
@@ -1509,5 +1515,33 @@ mod tests {
     world.attest("person", 500.0);
     let up = world.ingest(1_000.0, &[], None);
     assert_eq!(entered(&up), Some(true));
+  }
+
+  #[test]
+  fn a_recovered_walker_does_not_settle_on_arrival() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // walks in and stands for twenty seconds, well short of settling
+    let mut t = 0.0;
+    for i in 0..15 {
+      world.ingest(t, &[person(0.1 + i as f32 * 0.025)], None);
+      t += 400.0;
+    }
+    while t < 26_000.0 {
+      world.ingest(t, &[person(0.45)], None);
+      t += 400.0;
+    }
+    // unseen past the still grace: the track sleeps
+    let gone = t + WorldConfig::default().still_lost_grace_ms + 10_000.0;
+    while t < gone {
+      world.ingest(t, &[], None);
+      t += 400.0;
+    }
+    let up = world.ingest(t, &[person(0.45)], None);
+    assert!(up.events.iter().any(|e| e.kind() == "objectRecovered"));
+    assert!(
+      !up.events.iter().any(|e| e.kind() == "objectSettled"),
+      "the minutes unseen must not count as standing still"
+    );
+    assert!(up.tracked.iter().all(|s| s.state == TrackState::Active));
   }
 }
