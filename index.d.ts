@@ -12,10 +12,6 @@ export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-was
 export declare class CameraWorld {
   constructor()
   ingest(timestampMs: number, detections: Array<Detection>, cameraMotion?: CameraMotion | undefined | null): WorldIngestResult
-  /**
-   * A detector outside the world (the camera's own AI) saw `label` at
-   * `timestamp_ms`; lets a single sighting of ours confirm.
-   */
   attest(label: string, timestampMs: number): void
   setLines(lines: Array<DetectionLine>, aspectRatio: number): void
   notifyCameraMove(): void
@@ -89,10 +85,6 @@ export declare function nms(detections: Array<Detection>, iouThreshold: number, 
 export declare function nmsIndices(detections: Array<Detection>, iouThreshold: number): Array<number>
 
 export interface WorldEvent {
-  /**
-   * One of: objectEntered, objectLost, objectRecovered, objectSettled,
-   * objectWoke, objectDeparted, bestShotUpdated.
-   */
   eventType: string
   object: WorldObject
 }
@@ -103,10 +95,6 @@ export interface WorldIngestResult {
   removed: Array<number>
   events: Array<WorldEvent>
   crossings: Array<LineCrossingEvent>
-  /**
-   * Tracks first seen this tick and not confirmed yet. A witness may confirm
-   * one after the object left the frame, so the host can keep its picture.
-   */
   sightings: Array<WorldObject>
 }
 
@@ -121,16 +109,9 @@ export interface WorldObject {
   speed: number
   velocityX: number
   velocityY: number
-  /** One of: tentative, active, stationary, lost, departed. */
   state: string
-  /** Epoch ms since the object has been still; only set while state is stationary. */
   stationarySinceMs?: number
-  /**
-   * Epoch ms of the sighting this object describes; older than the tick when a
-   * track confirms through a witness without being seen again.
-   */
   lastSeenMs: number
-  /** True when the track confirmed on a camera-side report instead of a second sighting. */
   attested: boolean
 }
 
