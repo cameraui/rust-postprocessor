@@ -38,6 +38,7 @@ fn main() -> ExitCode {
           "wakeTicks" => config.wake_ticks = value as u32,
           "confirmMs" => config.confirm_ms = value,
           "maxDormant" => config.max_dormant = value as usize,
+          "dormantAnimateMs" => config.dormant_animate_ms = value,
           _ => {
             eprintln!("--world: unknown key {key}");
             return ExitCode::FAILURE;

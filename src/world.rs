@@ -37,6 +37,13 @@ pub struct WorldConfig {
   pub wake_ticks: u32,
   pub confirm_ms: f64,
   pub max_dormant: usize,
+  // how long a sleeping person or animal stays recoverable. A parked car is
+  // the same car hours later, a person seen at the gate is a new visitor
+  // minutes later: an entrance is where every visitor first appears, and a
+  // sleeper anchored there would claim each of them as its own quiet return.
+  // Five minutes on top of the still grace: a sitter the detector loses for
+  // a couple of minutes keeps their identity and their travel history
+  pub dormant_animate_ms: f64,
 }
 
 impl Default for WorldConfig {
@@ -55,6 +62,7 @@ impl Default for WorldConfig {
       wake_ticks: 3,
       confirm_ms: 500.0,
       max_dormant: 50,
+      dormant_animate_ms: 300_000.0,
     }
   }
 }
@@ -189,6 +197,14 @@ impl CameraWorld {
       self.evict_dormant();
     }
     self.last_t_ms = t_ms;
+
+    let dormant_animate_ms = self.config.dormant_animate_ms;
+    self.tracks.retain(|_, t| {
+      !(t.dormant && animate(&t.label) && t_ms - t.last_seen_ms > dormant_animate_ms)
+    });
+    self
+      .engine_map
+      .retain(|_, world_id| self.tracks.contains_key(world_id));
 
     // the caller reports an absolute pose offset, coarse and step-wise — too
     // coarse to stabilize engine coordinates (measured: it breaks association).
@@ -641,7 +657,11 @@ impl CameraWorld {
   ) -> Option<u32> {
     let label_id = self.label_ids.get(label).copied();
     let mut best: Option<(u32, f32)> = None;
-    for (id, track) in &self.tracks {
+    // fixed order: a map walk would break score ties by hash seed, and a replay
+    // has to land on the same identities as the live run
+    let mut candidates: Vec<(&u32, &WorldTrack)> = self.tracks.iter().collect();
+    candidates.sort_by_key(|(id, _)| **id);
+    for (id, track) in candidates {
       // dormant tracks, plus orphans the engine already forgot while the world
       // grace still runs; a freshly-seen track keeps its identity to itself
       let orphaned = t_ms - track.last_seen_ms > ORPHAN_MS;
@@ -679,16 +699,19 @@ impl CameraWorld {
         let contained =
           size_ok && (center_inside(bbox, reference) || center_inside(reference, bbox));
         // last resort for detector output flapping between two views of one body
-        // (torso-only vs legs-only): centers within half the larger reach still
-        // count, two neighboring parked cars sit a full width apart and stay out
+        // (torso-only vs legs-only, a window seam cutting it in half): centers
+        // within one width sideways and half a height up or down still count.
+        // Per axis, not by the larger side: a standing person is three widths
+        // tall, and a sideways tolerance of half a height would hand the
+        // identity to the next person over
         let near = size_ok && {
           let (ax, ay) = (
             reference[0] + reference[2] / 2.0,
             reference[1] + reference[3] / 2.0,
           );
           let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
-          let reach = reference[2].max(reference[3]).max(bbox[2].max(bbox[3]));
-          ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() <= reach * 0.5
+          (bx - ax).abs() <= reference[2].max(bbox[2])
+            && (by - ay).abs() <= reference[3].max(bbox[3]) * 0.5
         };
         let score = if iou >= self.config.reassoc_iou {
           1.0 + iou
@@ -749,7 +772,12 @@ impl CameraWorld {
         .tracks
         .iter()
         .filter(|(_, t)| t.dormant)
-        .min_by(|a, b| a.1.last_seen_ms.total_cmp(&b.1.last_seen_ms))
+        .min_by(|a, b| {
+          a.1
+            .last_seen_ms
+            .total_cmp(&b.1.last_seen_ms)
+            .then(a.0.cmp(b.0))
+        })
         .map(|(id, _)| *id);
       match oldest {
         Some(id) => self.tracks.remove(&id),
@@ -757,6 +785,10 @@ impl CameraWorld {
       };
     }
   }
+}
+
+fn animate(label: &str) -> bool {
+  matches!(label, "person" | "animal")
 }
 
 fn center_inside(of: &[f32; 4], within: &[f32; 4]) -> bool {
@@ -1205,5 +1237,108 @@ mod tests {
       created += update.created.len();
     }
     assert_eq!(created, 1, "after a camera move everything is new");
+  }
+
+  fn box_at(x: f32, y: f32, width: f32, height: f32, label: &str) -> Detection {
+    Detection {
+      x,
+      y,
+      width,
+      height,
+      confidence: 0.9,
+      label: label.to_string(),
+    }
+  }
+
+  // settles a track at the given box, then lets it fade into sleep
+  fn sleeper(world: &mut CameraWorld, det: &Detection, settle_ms: f64) -> f64 {
+    let mut t = 0.0;
+    while t <= settle_ms + 1_000.0 {
+      world.ingest(t, std::slice::from_ref(det), None);
+      t += 200.0;
+    }
+    let mut gone = t;
+    while gone - t <= WorldConfig::default().still_lost_grace_ms + 1_000.0 {
+      world.ingest(gone, &[], None);
+      gone += 1_000.0;
+    }
+    gone
+  }
+
+  #[test]
+  fn a_visitor_minutes_after_a_sitter_is_an_arrival() {
+    // the gate: everyone appears at the same spot, small and far
+    let gate = box_at(0.17, 0.49, 0.05, 0.27, "person");
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let quiet = sleeper(&mut world, &gate, WorldConfig::default().settle_person_ms);
+
+    let later = quiet + 13.0 * 60_000.0;
+    let mut entered = 0;
+    let mut recovered = 0;
+    for i in 0..4 {
+      let up = world.ingest(later + i as f64 * 200.0, &[gate.clone()], None);
+      entered += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectEntered")
+        .count();
+      recovered += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectRecovered")
+        .count();
+    }
+    assert_eq!(
+      entered, 1,
+      "a person at the gate minutes later is a new visitor"
+    );
+    assert_eq!(recovered, 0, "the old sitter must not claim the visitor");
+    assert!(world.tracks.values().all(|t| t.state == TrackState::Active));
+  }
+
+  #[test]
+  fn a_parked_car_hours_later_is_still_parked() {
+    let car = box_at(0.5, 0.5, 0.3, 0.2, "vehicle");
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let quiet = sleeper(&mut world, &car, WorldConfig::default().settle_vehicle_ms);
+
+    let up = world.ingest(quiet + 3.0 * 3_600_000.0, &[car], None);
+    assert!(up.created.is_empty(), "the car keeps its identity");
+    for e in &up.events {
+      match e {
+        SemanticEvent::ObjectEntered(_) | SemanticEvent::ObjectWoke(_) => {
+          panic!("a parked car read as an arrival")
+        }
+        SemanticEvent::ObjectRecovered(s) => assert_eq!(s.state, TrackState::Stationary),
+        _ => {}
+      }
+    }
+  }
+
+  #[test]
+  fn a_sleeper_does_not_claim_the_next_person_over() {
+    let sitter = box_at(0.17, 0.49, 0.05, 0.27, "person");
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let quiet = sleeper(&mut world, &sitter, WorldConfig::default().settle_person_ms);
+
+    // three body widths to the side, within the sleep window
+    let neighbour = box_at(0.32, 0.5, 0.05, 0.2, "person");
+    let mut entered = 0;
+    for i in 0..4 {
+      let up = world.ingest(
+        quiet + 30_000.0 + i as f64 * 200.0,
+        &[neighbour.clone()],
+        None,
+      );
+      entered += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectEntered")
+        .count();
+    }
+    assert_eq!(
+      entered, 1,
+      "a person beside the sleeper is their own identity"
+    );
   }
 }
