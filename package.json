@@ -39,7 +39,7 @@
     "version": "napi version"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.9.1",
+    "@napi-rs/cli": "^3.10.0",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@typescript-eslint/parser": "^8.70.0",
     "concurrently": "^10.0.5",
