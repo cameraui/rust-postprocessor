@@ -16,8 +16,6 @@ type TrackSegment = (u32, String, (f32, f32), (f32, f32));
 
 const ASSOCIATION_FLOOR: f32 = 0.1;
 const ORPHAN_MS: f64 = 1_500.0;
-// a camera-side report and our own sighting have to fall this close together
-// to count as the same object
 const ATTEST_WINDOW_MS: f64 = 3_000.0;
 
 pub struct WorldUpdate {
@@ -26,8 +24,6 @@ pub struct WorldUpdate {
   pub removed: Vec<u32>,
   pub events: Vec<SemanticEvent>,
   pub crossings: Vec<LineCrossingEvent>,
-  // tracks first seen this tick, still unconfirmed: a witness may confirm them
-  // after the object is gone, so the host can keep their picture meanwhile
   pub sightings: Vec<TrackSnapshot>,
 }
 
@@ -43,12 +39,6 @@ pub struct WorldConfig {
   pub wake_ticks: u32,
   pub confirm_ms: f64,
   pub max_dormant: usize,
-  // how long a sleeping person or animal stays recoverable. A parked car is
-  // the same car hours later, a person seen at the gate is a new visitor
-  // minutes later: an entrance is where every visitor first appears, and a
-  // sleeper anchored there would claim each of them as its own quiet return.
-  // Five minutes on top of the still grace: a sitter the detector loses for
-  // a couple of minutes keeps their identity and their travel history
   pub dormant_animate_ms: f64,
 }
 
@@ -60,7 +50,7 @@ impl Default for WorldConfig {
       still_lost_grace_ms: 60_000.0,
       settle_default_ms: 10_000.0,
       settle_vehicle_ms: 8_000.0,
-      // swept 2026-08-17 over live traces: 60s matches 120s on premature
+      // swept over live traces: 60s matches 120s on premature
       // settles but halves how long spans stay open; 30s doubles the noise
       settle_person_ms: 60_000.0,
       stationary_speed: 0.002,
@@ -92,6 +82,7 @@ struct WorldTrack {
   dormant: bool,
   slow_confirm: bool,
   wake_dist: f32,
+  confirmed_by_witness: bool,
 }
 
 pub struct CameraWorld {
@@ -135,9 +126,6 @@ impl CameraWorld {
     }
   }
 
-  /// A detector outside this world (the camera's own AI, an event feed) saw
-  /// `label` at `t_ms`. It never creates anything by itself: it lets a single
-  /// sighting of ours confirm without the persistence a flicker would fail.
   pub fn attest(&mut self, label: &str, t_ms: f64) {
     self.attestations.insert(label.to_string(), t_ms);
   }
@@ -378,6 +366,7 @@ impl CameraWorld {
                 dormant: false,
                 slow_confirm,
                 wake_dist: 0.0,
+                confirmed_by_witness: false,
               },
             );
             sightings.push(snapshot(born, &self.tracks[&born]));
@@ -409,6 +398,7 @@ impl CameraWorld {
           maybe_best_shot(world_id, track, &mut events);
           continue;
         }
+        track.confirmed_by_witness = t_ms - track.first_seen_ms < confirm_ms;
         track.state = TrackState::Active;
         track.origin = track.bbox;
         created.push(world_id);
@@ -527,6 +517,7 @@ impl CameraWorld {
           .get(&track.label)
           .is_some_and(|at| (at - track.last_seen_ms).abs() <= ATTEST_WINDOW_MS);
         if attested {
+          track.confirmed_by_witness = true;
           track.state = TrackState::Active;
           track.origin = track.bbox;
           created.push(*id);
@@ -875,6 +866,7 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     state: t.state,
     stationary_since_ms: (t.state == TrackState::Stationary).then_some(t.still_since_ms),
     last_seen_ms: t.last_seen_ms,
+    attested: t.confirmed_by_witness,
   }
 }
 
@@ -897,7 +889,6 @@ mod tests {
     }
   }
 
-  // drawn bottom to top, so the A side is the left half of the image
   fn vertical_line_at(x_ui: f64, name: &str) -> DetectionLineInput {
     DetectionLineInput {
       name: name.to_string(),
@@ -1490,5 +1481,33 @@ mod tests {
     assert_eq!(up.tracked[0].last_seen_ms, 0.0);
     let up = world.ingest(1_200.0, &[], None);
     assert!(up.tracked.is_empty(), "delivered once, not every tick");
+  }
+
+  #[test]
+  fn an_entered_snapshot_says_whether_a_witness_confirmed_it() {
+    let entered = |up: &WorldUpdate| {
+      up.events.iter().find_map(|e| match e {
+        SemanticEvent::ObjectEntered(s) => Some(s.attested),
+        _ => None,
+      })
+    };
+    // the usual way: two sightings
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.ingest(0.0, &[person(0.3)], None);
+    let up = world.ingest(600.0, &[person(0.3)], None);
+    assert_eq!(entered(&up), Some(false));
+
+    // a report before the sighting decides at once
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.attest("person", 0.0);
+    let up = world.ingest(100.0, &[person(0.3)], None);
+    assert_eq!(entered(&up), Some(true));
+
+    // a report after the only sighting decides in the retain pass
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.ingest(0.0, &[person(0.3)], None);
+    world.attest("person", 500.0);
+    let up = world.ingest(1_000.0, &[], None);
+    assert_eq!(entered(&up), Some(true));
   }
 }

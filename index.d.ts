@@ -130,6 +130,8 @@ export interface WorldObject {
    * track confirms through a witness without being seen again.
    */
   lastSeenMs: number
+  /** True when the track confirmed on a camera-side report instead of a second sighting. */
+  attested: boolean
 }
 
 export declare const enum ZoneFilterMode {

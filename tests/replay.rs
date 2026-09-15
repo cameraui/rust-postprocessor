@@ -30,6 +30,7 @@ fn tick(index: usize, detections: Vec<Detection>) -> ReplayTick {
     t_ms: index as f64 * TICK_MS,
     detections,
     camera_motion: None,
+    witness: Vec::new(),
   }
 }
 

@@ -20,6 +20,8 @@ pub struct ReplayTick {
   pub detections: Vec<Detection>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub camera_motion: Option<CameraMotion>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub witness: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +127,9 @@ pub fn run_world_items_with(
         }
         ReplayItem::Tick(tick) => tick,
       };
+      for label in &tick.witness {
+        world.attest(label, tick.t_ms);
+      }
       let update = world.ingest(
         tick.t_ms,
         &tick.detections,
@@ -351,5 +356,27 @@ fn latency_stats(latencies_us: &mut [u64]) -> LatencyStats {
     p50_us: at(0.5),
     p95_us: at(0.95),
     max_us: latencies_us[latencies_us.len() - 1],
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_witnessed_tick_confirms_a_lone_sighting_in_replay() {
+    let lone = r#"{"tMs":0,"detections":[{"x":0.3,"y":0.4,"width":0.1,"height":0.2,"confidence":0.9,"label":"person"}]}
+{"tMs":200,"detections":[]}
+{"tMs":1000,"detections":[]}"#;
+    let ticks = read_jsonl(lone).unwrap();
+    assert_eq!(run_world(&ticks, false).tracks_created, 0);
+
+    let witnessed = lone.replacen(
+      "\"detections\":[{",
+      "\"witness\":[\"person\"],\"detections\":[{",
+      1,
+    );
+    let ticks = read_jsonl(&witnessed).unwrap();
+    assert_eq!(run_world(&ticks, false).tracks_created, 1);
   }
 }
