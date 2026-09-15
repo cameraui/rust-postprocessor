@@ -24,7 +24,7 @@ napi-derive = "3.6.5"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 trackforge = { path = "./externals/trackforge", default-features = false }
-wide = "1.7.0"
+wide = "1.7.1"
 
 [build-dependencies]
 napi-build = "2.4.2"
