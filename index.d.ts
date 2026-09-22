@@ -80,10 +80,6 @@ export declare const enum LineDirection {
 
 export declare function merge(detections: Array<Detection>, iouThreshold: number, closeThreshold: number, containment?: MergeContainment | undefined | null): Array<Detection>
 
-/**
- * Labels whose pairs only merge when the smaller box lies `minShare` inside
- * the bigger one.
- */
 export interface MergeContainment {
   labels: Array<string>
   minShare: number
