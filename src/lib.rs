@@ -215,15 +215,29 @@ pub fn nms_indices(detections: Vec<Detection>, iou_threshold: f64) -> Vec<u32> {
     .collect()
 }
 
+#[napi(object)]
+pub struct MergeContainment {
+  pub labels: Vec<String>,
+  pub min_share: f64,
+}
+
 #[napi]
 pub fn merge(
   detections: Vec<Detection>,
   iou_threshold: f64,
   close_threshold: f64,
+  containment: Option<MergeContainment>,
 ) -> Vec<Detection> {
   let internal: Vec<crate::types::Detection> = detections.into_iter().map(to_internal).collect();
-  let merged =
-    crate::merge::merge_detections(internal, iou_threshold as f32, close_threshold as f32);
+  let (labels, min_share) =
+    containment.map_or((Vec::new(), 0.0), |c| (c.labels, c.min_share as f32));
+  let merged = crate::merge::merge_detections_contained(
+    internal,
+    iou_threshold as f32,
+    close_threshold as f32,
+    &labels,
+    min_share,
+  );
   merged.into_iter().map(from_internal).collect()
 }
 

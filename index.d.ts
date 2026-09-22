@@ -78,7 +78,16 @@ export declare const enum LineDirection {
   BToA = 'b-to-a',
 }
 
-export declare function merge(detections: Array<Detection>, iouThreshold: number, closeThreshold: number): Array<Detection>
+export declare function merge(detections: Array<Detection>, iouThreshold: number, closeThreshold: number, containment?: MergeContainment | undefined | null): Array<Detection>
+
+/**
+ * Labels whose pairs only merge when the smaller box lies `minShare` inside
+ * the bigger one.
+ */
+export interface MergeContainment {
+  labels: Array<string>
+  minShare: number
+}
 
 export declare function nms(detections: Array<Detection>, iouThreshold: number, maxDetections?: number | undefined | null): Array<Detection>
 
