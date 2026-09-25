@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use crate::types::Detection;
 
+const FRAGMENT_SHARE: f32 = 0.9;
+const FRAGMENT_EDGE: f32 = 0.05;
+
 #[cfg(test)]
 pub fn merge_detections(
   detections: Vec<Detection>,
@@ -108,7 +111,12 @@ fn merge_cluster(
         0.0
       };
       let smaller = i_area.min(boxes[off_j + 4]);
-      let contained = min_share <= 0.0 || (smaller > 0.0 && inter_area / smaller >= min_share);
+      let share = if smaller > 0.0 {
+        inter_area / smaller
+      } else {
+        0.0
+      };
+      let contained = min_share <= 0.0 || share >= min_share;
 
       let close = (ix1 - boxes[off_j]).abs() <= close_threshold
         && (iy1 - boxes[off_j + 1]).abs() <= close_threshold;
@@ -121,6 +129,20 @@ fn merge_cluster(
 
       if inter_area <= 0.0 {
         continue;
+      }
+      if min_share > 0.0 && share >= FRAGMENT_SHARE {
+        let (small, big) = if i_area <= boxes[off_j + 4] {
+          (off_i, off_j)
+        } else {
+          (off_j, off_i)
+        };
+        let tolerance = (boxes[big + 3] - boxes[big + 1]) * FRAGMENT_EDGE;
+        if (boxes[small + 1] - boxes[big + 1]).abs() <= tolerance
+          || (boxes[small + 3] - boxes[big + 3]).abs() <= tolerance
+        {
+          union(&mut parent, i, j);
+          continue;
+        }
       }
       let union_area = i_area + boxes[off_j + 4] - inter_area;
       if union_area <= 0.0 {
@@ -307,6 +329,47 @@ mod tests {
     let out = merge_detections_contained(input, 0.3, 0.0, &people, 0.85);
     assert_eq!(out.len(), 1);
     assert!((out[0].confidence - 0.80).abs() < 1e-6);
+  }
+
+  #[test]
+  fn contained_label_merges_a_small_fragment_cut_at_a_seam() {
+    // hof: the legs below a window edge and a crouching child's head, both
+    // far below iou 0.3 but on the body's bottom or top edge
+    let people = vec!["person".to_string()];
+    let legs = vec![
+      det(0.570, 0.147, 0.062, 0.213, 0.90, "person"),
+      det(0.573, 0.289, 0.034, 0.071, 0.77, "person"),
+    ];
+    let head = vec![
+      det(0.430, 0.773, 0.102, 0.226, 0.80, "person"),
+      det(0.433, 0.775, 0.071, 0.076, 0.44, "person"),
+    ];
+    assert_eq!(
+      merge_detections_contained(legs.clone(), 0.3, 0.0, &[], 0.0).len(),
+      2
+    );
+    assert_eq!(
+      merge_detections_contained(legs, 0.3, 0.0, &people, 0.85).len(),
+      1
+    );
+    assert_eq!(
+      merge_detections_contained(head, 0.3, 0.0, &people, 0.85).len(),
+      1
+    );
+  }
+
+  #[test]
+  fn contained_label_keeps_a_person_hidden_inside_another_box() {
+    // walkout: a woman on the sofa behind the man, 94 % inside his box
+    let input = vec![
+      det(0.871, 0.431, 0.129, 0.248, 0.70, "person"),
+      det(0.868, 0.524, 0.052, 0.120, 0.53, "person"),
+    ];
+    let people = vec!["person".to_string()];
+    assert_eq!(
+      merge_detections_contained(input, 0.3, 0.0, &people, 0.85).len(),
+      2
+    );
   }
 
   #[test]

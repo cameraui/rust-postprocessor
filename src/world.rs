@@ -17,6 +17,7 @@ type TrackSegment = (u32, String, (f32, f32), (f32, f32));
 const ASSOCIATION_FLOOR: f32 = 0.1;
 const ORPHAN_MS: f64 = 1_500.0;
 const ATTEST_WINDOW_MS: f64 = 3_000.0;
+const ENGINE_SPLIT: f32 = 0.5;
 
 pub struct WorldUpdate {
   pub tracked: Vec<TrackSnapshot>,
@@ -70,9 +71,16 @@ struct WorldTrack {
   anchor: [f32; 4],
   // box at confirmation, net travel since then separates leavers from sitters
   origin: [f32; 4],
+  // the score of the last sighting above the user threshold: a weak tick keeps
+  // the track alive but must not report the object as a 0.3 guess
   confidence: f32,
+  score: f32,
   speed: f32,
   velocity: (f32, f32),
+  // the same average in frame fractions per second, what consumers get: the
+  // still logic keeps its per-tick scale, tuned on replays
+  speed_s: f32,
+  velocity_s: (f32, f32),
   state: TrackState,
   still_since_ms: f64,
   last_seen_ms: f64,
@@ -101,6 +109,9 @@ pub struct CameraWorld {
   labels: Vec<String>,
   label_ids: HashMap<String, i64>,
   pose_baseline: Option<(f32, f32)>,
+  // when the pose last moved: the engine lost every track the jump outran, so
+  // tracks unseen since then re-associate without waiting out the orphan delay
+  pose_moved_ms: f64,
   // label -> when a camera-side detector last reported it
   attestations: HashMap<String, f64>,
 }
@@ -109,7 +120,7 @@ impl CameraWorld {
   pub fn new(config: WorldConfig) -> Self {
     Self {
       config,
-      engine: new_engine(),
+      engine: new_engine(ENGINE_SPLIT),
       tracks: HashMap::new(),
       engine_map: HashMap::new(),
       next_id: 1,
@@ -122,6 +133,7 @@ impl CameraWorld {
       labels: Vec::new(),
       label_ids: HashMap::new(),
       pose_baseline: None,
+      pose_moved_ms: 0.0,
       attestations: HashMap::new(),
     }
   }
@@ -143,6 +155,8 @@ impl CameraWorld {
 
   pub fn set_min_confidence(&mut self, min_confidence: f32) {
     self.min_confidence = min_confidence.max(0.0);
+    let split = self.engine_split();
+    self.engine.set_thresholds(split, split);
   }
 
   pub fn set_min_confidences(&mut self, by_label: HashMap<String, f32>) {
@@ -199,7 +213,7 @@ impl CameraWorld {
       // a decode gap is not evidence anything left: engine restarts, world
       // tracks sleep and wait for re-association; an unconfirmed flicker has
       // no identity to preserve and must not become a re-association anchor
-      self.engine = new_engine();
+      self.engine = new_engine(self.engine_split());
       self.engine_map.clear();
       self.tracks.retain(|_, t| t.state != TrackState::Tentative);
       for track in self.tracks.values_mut() {
@@ -218,10 +232,12 @@ impl CameraWorld {
       .engine_map
       .retain(|_, world_id| self.tracks.contains_key(world_id));
 
-    // the caller reports an absolute pose offset, coarse and step-wise — too
-    // coarse to stabilize engine coordinates (measured: it breaks association).
-    // The engine works on raw image coords; stored positions shift by the
-    // offset change so speed and anchors stay pan-clean
+    // the caller reports an absolute pose offset, coarse and late: shifting the
+    // engine by it misplaces every track the engine already followed through the
+    // move (measured, the report lands after the picture moved). The engine keeps
+    // raw image coords, its lost tracks drop the camera's motion they coast on,
+    // and stored positions shift by the offset change so speed and anchors stay
+    // pan-clean
     if let Some((mx, my)) = camera_motion {
       let (lx, ly) = *self.pose_baseline.get_or_insert((mx, my));
       let (dx, dy) = (mx - lx, my - ly);
@@ -231,7 +247,11 @@ impl CameraWorld {
           track.bbox[1] += dy;
           track.anchor[0] += dx;
           track.anchor[1] += dy;
+          track.origin[0] += dx;
+          track.origin[1] += dy;
         }
+        self.engine.forget_lost_motion();
+        self.pose_moved_ms = t_ms;
       }
       self.pose_baseline = Some((mx, my));
     }
@@ -264,9 +284,15 @@ impl CameraWorld {
       .collect();
 
     let mut seen: Vec<u32> = Vec::new();
+    let mut claimed: HashSet<u32> = HashSet::new();
     let mut segments: Vec<TrackSegment> = Vec::new();
     let tick_detections = detections.clone();
-    for t in self.engine.update(detections) {
+    // continuations claim their identities before a newcomer may re-associate
+    // one of them; otherwise a fragment born this tick grabs an identity whose
+    // own engine track the engine refinds in the very same tick
+    let mut engine_tracks = self.engine.update(detections);
+    engine_tracks.sort_by_key(|t| !self.engine_map.contains_key(&(t.track_id as u32)));
+    for t in engine_tracks {
       if !t.is_activated {
         continue;
       }
@@ -275,6 +301,7 @@ impl CameraWorld {
         continue;
       };
       let bbox = t.tlwh;
+      let strong = t.score >= self.min_confidence_for(&label);
 
       // a same-class passer-by steals a stationary track's engine identity the
       // moment their boxes overlap and drags it along. Two signatures: some
@@ -307,13 +334,24 @@ impl CameraWorld {
         }
       }
 
+      // one engine track per identity and tick: a second one is another view
+      // of a body that already reported
+      if let Some(id) = self.engine_map.get(&engine_id) {
+        if claimed.contains(id) {
+          self.engine_map.remove(&engine_id);
+          continue;
+        }
+      }
+
       let world_id = match self.engine_map.get(&engine_id) {
         Some(id) if self.tracks.contains_key(id) => *id,
         _ => {
-          // dormant resume is continuation and allowed at any score; a NEW
-          // identity needs the user threshold at least once
+          // an orphan inside its grace continues at any score; a sleeper
+          // reopens a span when it resumes and a NEW identity starts one, both
+          // need the user threshold
           let reassociated = self.reassociate(&label, &bbox, t_ms, &tick_detections);
-          if reassociated.is_none() && t.score < self.min_confidence_for(&label) {
+          let resumes_sleeper = reassociated.is_some_and(|id| self.tracks[&id].dormant);
+          if (reassociated.is_none() || resumes_sleeper) && !strong {
             continue;
           }
           // a second engine track overlapping a live, freshly-seen world track
@@ -355,8 +393,11 @@ impl CameraWorld {
                 anchor: bbox,
                 origin: bbox,
                 confidence: t.score,
+                score: t.score,
                 speed: 0.0,
                 velocity: (0.0, 0.0),
+                speed_s: 0.0,
+                velocity_s: (0.0, 0.0),
                 state: TrackState::Tentative,
                 still_since_ms: t_ms,
                 last_seen_ms: t_ms,
@@ -372,10 +413,14 @@ impl CameraWorld {
             sightings.push(snapshot(born, &self.tracks[&born]));
             id
           });
+          // the identity moves to this engine track; a lost engine track still
+          // bound to it must not come back as a second writer
+          self.engine_map.retain(|_, world_id| *world_id != id);
           self.engine_map.insert(engine_id, id);
           id
         }
       };
+      claimed.insert(world_id);
 
       let confirm_ms = self.config.confirm_ms;
       let settle_ms = self.settle_ms(&label);
@@ -384,21 +429,26 @@ impl CameraWorld {
       if track.state == TrackState::Tentative {
         // an identity is persistence over time, independent of tick rate: a
         // single flicker never re-sights after the window and dies silently.
-        // Two detectors agreeing is persistence enough
+        // Two detectors agreeing is persistence enough. A sighting below the
+        // user threshold keeps a newcomer alive but never confirms it
         let confirm_ms = if track.slow_confirm {
           confirm_ms * 4.0
         } else {
           confirm_ms
         };
-        if t_ms - track.first_seen_ms < confirm_ms && !attested {
+        let unconfirmed = t_ms - track.first_seen_ms < confirm_ms || !strong;
+        if unconfirmed && !attested {
           track.bbox = bbox;
           track.anchor = bbox;
-          track.confidence = t.score;
+          track.score = t.score;
+          if strong {
+            track.confidence = t.score;
+          }
           track.last_seen_ms = t_ms;
           maybe_best_shot(world_id, track, &mut events);
           continue;
         }
-        track.confirmed_by_witness = t_ms - track.first_seen_ms < confirm_ms;
+        track.confirmed_by_witness = unconfirmed;
         track.state = TrackState::Active;
         track.origin = track.bbox;
         created.push(world_id);
@@ -412,6 +462,8 @@ impl CameraWorld {
       if was_dormant {
         track.speed = 0.0;
         track.velocity = (0.0, 0.0);
+        track.speed_s = 0.0;
+        track.velocity_s = (0.0, 0.0);
         // time unseen says nothing about a person standing still: a walker who
         // comes back restarts the still clock instead of settling on arrival.
         // A vehicle that drove in and is seen again on the same spot has parked
@@ -429,6 +481,13 @@ impl CameraWorld {
           track.velocity.1 * 0.6 + dy * 0.4,
         );
         track.speed = (track.velocity.0.powi(2) + track.velocity.1.powi(2)).sqrt();
+        // real time between sightings, whatever the frame or tick rate was
+        let per_s = 1000.0 / dt.max(50.0) as f32;
+        track.velocity_s = (
+          track.velocity_s.0 * 0.6 + (cx - px) * per_s * 0.4,
+          track.velocity_s.1 * 0.6 + (cy - py) * per_s * 0.4,
+        );
+        track.speed_s = (track.velocity_s.0.powi(2) + track.velocity_s.1.powi(2)).sqrt();
       }
       track.dormant = false;
       // a segment across a decode gap is not a movement, it is missing time
@@ -439,7 +498,10 @@ impl CameraWorld {
         // state, consumers decide whether stationary scenery counts
         events.push(SemanticEvent::ObjectRecovered(snapshot(world_id, track)));
       }
-      track.confidence = t.score;
+      track.score = t.score;
+      if strong {
+        track.confidence = t.score;
+      }
       track.bbox = bbox;
       track.last_seen_ms = t_ms;
 
@@ -467,7 +529,8 @@ impl CameraWorld {
         if moving && departed_anchor && traveling {
           track.wake_dist = anchor_dist;
           track.moving_streak += 1;
-          if track.moving_streak >= self.config.wake_ticks {
+          // waking opens a span: the tick that completes it has to be strong
+          if track.moving_streak >= self.config.wake_ticks && strong {
             track.state = TrackState::Active;
             track.still_since_ms = t_ms;
             track.moving_streak = 0;
@@ -709,7 +772,8 @@ impl CameraWorld {
     for (id, track) in candidates {
       // dormant tracks, plus orphans the engine already forgot while the world
       // grace still runs; a freshly-seen track keeps its identity to itself
-      let orphaned = t_ms - track.last_seen_ms > ORPHAN_MS;
+      let orphaned =
+        t_ms - track.last_seen_ms > ORPHAN_MS || track.last_seen_ms < self.pose_moved_ms;
       if (!track.dormant && !orphaned) || track.label != label {
         continue;
       }
@@ -803,6 +867,14 @@ impl CameraWorld {
     })
   }
 
+  fn engine_split(&self) -> f32 {
+    if self.min_confidence > 0.0 {
+      self.min_confidence.min(ENGINE_SPLIT)
+    } else {
+      ENGINE_SPLIT
+    }
+  }
+
   fn settle_ms(&self, label: &str) -> f64 {
     match label {
       "vehicle" => self.config.settle_vehicle_ms,
@@ -846,15 +918,15 @@ fn maybe_best_shot(world_id: u32, track: &mut WorldTrack, events: &mut Vec<Seman
   let b = &track.bbox;
   let clipped = b[0] <= 0.005 || b[1] <= 0.005 || b[0] + b[2] >= 0.995 || b[1] + b[3] >= 0.995;
   let edge_penalty = if clipped { 0.3 } else { 1.0 };
-  let score = track.confidence * (b[2] * b[3]).sqrt() * edge_penalty;
+  let score = track.score * (b[2] * b[3]).sqrt() * edge_penalty;
   if score > track.best_shot_score * 1.25 {
     track.best_shot_score = score;
     events.push(SemanticEvent::BestShotUpdated(snapshot(world_id, track)));
   }
 }
 
-fn new_engine() -> ByteTrack {
-  ByteTrack::new(0.5, 30, 0.9, 0.5)
+fn new_engine(split: f32) -> ByteTrack {
+  ByteTrack::new(split, 30, 0.9, split)
 }
 
 fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
@@ -866,9 +938,9 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     width: t.bbox[2],
     height: t.bbox[3],
     confidence: t.confidence,
-    speed: t.speed,
-    velocity_x: t.velocity.0,
-    velocity_y: t.velocity.1,
+    speed: t.speed_s,
+    velocity_x: t.velocity_s.0,
+    velocity_y: t.velocity_s.1,
     state: t.state,
     stationary_since_ms: (t.state == TrackState::Stationary).then_some(t.still_since_ms),
     last_seen_ms: t.last_seen_ms,
@@ -1214,8 +1286,8 @@ mod tests {
         .count();
       for t in &update.tracked {
         assert!(
-          t.speed < 0.002,
-          "pan must not read as movement, got {}",
+          t.speed < 0.01,
+          "pan must not read as movement, got {}/s",
           t.speed
         );
       }
@@ -1543,5 +1615,233 @@ mod tests {
       "the minutes unseen must not count as standing still"
     );
     assert!(up.tracked.iter().all(|s| s.state == TrackState::Active));
+  }
+
+  fn ids_unique(up: &WorldUpdate) -> bool {
+    let mut ids: Vec<u32> = up.tracked.iter().map(|t| t.track_id).collect();
+    let n = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len() == n
+  }
+
+  #[test]
+  fn a_fragment_never_shares_an_identity_with_its_refound_body() {
+    let body = box_at(0.57, 0.15, 0.06, 0.21, "person");
+    let legs = box_at(0.572, 0.289, 0.034, 0.071, "person");
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    while t <= 3_000.0 {
+      world.ingest(t, std::slice::from_ref(&body), None);
+      t += 200.0;
+    }
+    // unseen long enough to count as orphaned, short enough for the engine to
+    // still hold its lost track
+    while t <= 5_400.0 {
+      world.ingest(t, &[], None);
+      t += 200.0;
+    }
+    for _ in 0..10 {
+      let up = world.ingest(t, &[body.clone(), legs.clone()], None);
+      assert!(ids_unique(&up), "two engine tracks wrote one identity");
+      t += 200.0;
+    }
+  }
+
+  #[test]
+  fn an_identity_that_moved_on_does_not_return_to_its_old_engine_track() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    while t <= 3_000.0 {
+      world.ingest(t, &[box_at(0.44, 0.1, 0.06, 0.3, "person")], None);
+      t += 200.0;
+    }
+    while t <= 5_400.0 {
+      world.ingest(t, &[], None);
+      t += 200.0;
+    }
+    // back a little to the side, too far for the engine, near enough to resume
+    let mut walker_id = None;
+    for i in 0..6 {
+      let walker = box_at(0.49, 0.1 + i as f32 * 0.04, 0.06, 0.3, "person");
+      let up = world.ingest(t, &[walker], None);
+      walker_id = walker_id.or(up.tracked.first().map(|s| s.track_id));
+      t += 200.0;
+    }
+    let walker_id = walker_id.expect("the walker resumed an identity");
+    // someone else steps onto the old spot while the walker is out of sight
+    let mut stranger = Vec::new();
+    for _ in 0..5 {
+      let up = world.ingest(t, &[box_at(0.44, 0.1, 0.06, 0.3, "person")], None);
+      stranger.extend(up.tracked.iter().map(|s| s.track_id));
+      t += 200.0;
+    }
+    assert!(
+      !stranger.contains(&walker_id),
+      "the stranger took over the walker's identity"
+    );
+  }
+
+  #[test]
+  fn a_threshold_below_the_engine_default_still_lets_objects_in() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.4);
+    let mut created = 0;
+    for i in 0..20 {
+      let mut d = person(0.2 + i as f32 * 0.01);
+      d.confidence = 0.45;
+      created += world.ingest(i as f64 * 200.0, &[d], None).created.len();
+    }
+    assert_eq!(
+      created, 1,
+      "a 0.45 person under a 0.4 threshold is an arrival"
+    );
+  }
+
+  #[test]
+  fn weak_sightings_carry_a_track_but_never_confirm_one() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let seen = |x: f32, confidence: f32| {
+      let mut d = person(x);
+      d.confidence = confidence;
+      d
+    };
+    // one sighting above the threshold, then only weak ones: a stone read as a
+    // person once is not a person
+    let mut created = 0;
+    world.ingest(0.0, &[seen(0.3, 0.75)], None);
+    for i in 1..20 {
+      created += world
+        .ingest(i as f64 * 200.0, &[seen(0.3, 0.35)], None)
+        .created
+        .len();
+    }
+    assert_eq!(created, 0, "weak sightings confirmed a newcomer");
+
+    // a confirmed walker keeps its identity through a weak stretch
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let mut ids = HashSet::new();
+    for i in 0..30 {
+      let confidence = if (10..20).contains(&i) { 0.35 } else { 0.8 };
+      let up = world.ingest(
+        i as f64 * 200.0,
+        &[seen(0.2 + i as f32 * 0.01, confidence)],
+        None,
+      );
+      ids.extend(up.tracked.iter().map(|s| s.track_id));
+      if (10..20).contains(&i) {
+        assert_eq!(up.tracked.len(), 1, "weak tick {i} dropped the walker");
+        assert_eq!(
+          up.tracked[0].confidence, 0.8,
+          "a weak tick reported its own score"
+        );
+      }
+    }
+    assert_eq!(ids.len(), 1, "the weak stretch split the walker");
+  }
+
+  fn kinds(up: &WorldUpdate) -> Vec<&'static str> {
+    up.events.iter().map(|e| e.kind()).collect()
+  }
+
+  #[test]
+  fn a_weak_sighting_never_resumes_a_sleeper() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let seen = |x: f32, confidence: f32| {
+      let mut d = person(x);
+      d.confidence = confidence;
+      d
+    };
+    for i in 0..10 {
+      world.ingest(i as f64 * 200.0, &[seen(0.2 + i as f32 * 0.02, 0.8)], None);
+    }
+    // the cascade pauses: every track sleeps across the decode gap
+    let mut t = 10_000.0;
+    for _ in 0..5 {
+      let up = world.ingest(t, &[seen(0.38, 0.6)], None);
+      assert!(
+        up.tracked.is_empty() && up.events.is_empty(),
+        "a weak sighting woke the sleeper: {:?}",
+        kinds(&up)
+      );
+      t += 200.0;
+    }
+    let up = world.ingest(t, &[seen(0.38, 0.8)], None);
+    assert!(
+      kinds(&up).contains(&"objectRecovered"),
+      "a strong sighting resumes it"
+    );
+    assert!(up.created.is_empty(), "the identity is kept");
+  }
+
+  #[test]
+  fn only_a_strong_sighting_completes_a_wake() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let car = |x: f32, confidence: f32| {
+      let mut d = box_at(x, 0.5, 0.3, 0.2, "vehicle");
+      d.confidence = confidence;
+      d
+    };
+    let mut t = 0.0;
+    while t <= WorldConfig::default().settle_vehicle_ms + 2_000.0 {
+      world.ingest(t, &[car(0.2, 0.8)], None);
+      t += 200.0;
+    }
+    // drives off, seen only below the threshold
+    let mut x = 0.2;
+    for _ in 0..30 {
+      x += 0.015;
+      let up = world.ingest(t, &[car(x, 0.6)], None);
+      assert!(
+        !kinds(&up).contains(&"objectWoke"),
+        "weak sightings woke the parked car"
+      );
+      t += 200.0;
+    }
+    x += 0.015;
+    let up = world.ingest(t, &[car(x, 0.8)], None);
+    assert!(
+      kinds(&up).contains(&"objectWoke"),
+      "the first strong sighting on the way completes the wake"
+    );
+  }
+
+  #[test]
+  fn reported_speed_is_per_second_whatever_the_tick_rate() {
+    // 0.1 frame widths per second, seen every 100 ms and every 200 ms
+    for tick_ms in [100.0_f32, 200.0] {
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut last = None;
+      for i in 0..40 {
+        let t = i as f32 * tick_ms;
+        let up = world.ingest(t as f64, &[person(0.2 + 0.1 * t / 1000.0)], None);
+        last = up.tracked.first().map(|s| (s.speed, s.velocity_x));
+      }
+      let (speed, vx) = last.expect("tracked");
+      assert!((speed - 0.1).abs() < 0.01, "{tick_ms} ms ticks: {speed}/s");
+      assert!((vx - 0.1).abs() < 0.01);
+    }
+  }
+  #[test]
+  fn a_pan_that_outruns_the_engine_keeps_the_identity_at_once() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut id = None;
+    for i in 0..10 {
+      let up = world.ingest(i as f64 * 100.0, &[person(0.5)], Some((0.0, 0.0)));
+      id = id.or(up.tracked.first().map(|s| s.track_id));
+    }
+    let id = id.expect("confirmed");
+    // the camera pans right by three box widths between two ticks
+    let up = world.ingest(1_000.0, &[person(0.2)], Some((-0.3, 0.0)));
+    assert_eq!(
+      up.tracked.iter().map(|s| s.track_id).collect::<Vec<_>>(),
+      vec![id],
+      "the person vanished or was reborn after the pan"
+    );
+    assert!(up.created.is_empty());
   }
 }
