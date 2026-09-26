@@ -69,6 +69,11 @@ struct WorldTrack {
   bbox: [f32; 4],
   // last box while stationary; a stolen engine box must not drag the anchor
   anchor: [f32; 4],
+  // a fade's last box is a guess until the object is seen on it; till then a
+  // person or animal also wakes by leaving the spot it was last seen still
+  anchor_seen: bool,
+  rest: [f32; 4],
+  rest_dist: f32,
   // box at confirmation, net travel since then separates leavers from sitters
   origin: [f32; 4],
   // the score of the last sighting above the user threshold: a weak tick keeps
@@ -247,6 +252,8 @@ impl CameraWorld {
           track.bbox[1] += dy;
           track.anchor[0] += dx;
           track.anchor[1] += dy;
+          track.rest[0] += dx;
+          track.rest[1] += dy;
           track.origin[0] += dx;
           track.origin[1] += dy;
         }
@@ -343,6 +350,10 @@ impl CameraWorld {
         }
       }
 
+      let continued = self
+        .engine_map
+        .get(&engine_id)
+        .is_some_and(|id| self.tracks.contains_key(id));
       let world_id = match self.engine_map.get(&engine_id) {
         Some(id) if self.tracks.contains_key(id) => *id,
         _ => {
@@ -391,6 +402,9 @@ impl CameraWorld {
                 label: label.clone(),
                 bbox,
                 anchor: bbox,
+                anchor_seen: false,
+                rest: bbox,
+                rest_dist: 0.0,
                 origin: bbox,
                 confidence: t.score,
                 score: t.score,
@@ -512,22 +526,34 @@ impl CameraWorld {
         // deformed or swapped box view: an occluder or a torso-vs-legs detector
         // flap must not wake a parked object. The reach comes from the anchor
         // alone: the current box of someone standing up fills half the frame
-        // and must not raise the bar for their own wake
-        let anchor_dist = {
-          let (ax, ay) = (
-            track.anchor[0] + track.anchor[2] / 2.0,
-            track.anchor[1] + track.anchor[3] / 2.0,
-          );
+        // and must not raise the bar for their own wake. Real departure keeps
+        // gaining distance tick over tick; a detector view swap jumps once and
+        // then holds still, and must not wake anything
+        let leaves = |home: &[f32; 4], gained: f32| {
+          let (ax, ay) = (home[0] + home[2] / 2.0, home[1] + home[3] / 2.0);
           let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
-          ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
+          let dist = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+          let reach = home[2].max(home[3]);
+          (box_iou(home, &bbox) < 0.15 && dist > reach * 0.5 && dist > gained + 0.005)
+            .then_some(dist)
         };
-        let reach = track.anchor[2].max(track.anchor[3]);
-        let departed_anchor = anchor_iou < 0.15 && anchor_dist > reach * 0.5;
-        // real departure keeps gaining distance tick over tick; a detector view
-        // swap jumps once and then holds still, and must not wake anything
-        let traveling = anchor_dist > track.wake_dist + 0.005;
-        if moving && departed_anchor && traveling {
-          track.wake_dist = anchor_dist;
+        // a re-association may have handed the identity to another body: where
+        // it reappears is the only rest this chain of sightings knows
+        if !continued {
+          track.rest = bbox;
+        }
+        let from_anchor = leaves(&track.anchor, track.wake_dist);
+        // a view that still holds the rest spot is a body coming back into sight
+        // from behind someone, not one leaving
+        let from_rest =
+          if track.anchor_seen || !animate(&track.label) || center_inside(&track.rest, &bbox) {
+            None
+          } else {
+            leaves(&track.rest, track.rest_dist)
+          };
+        if moving && (from_anchor.is_some() || from_rest.is_some()) {
+          track.wake_dist = from_anchor.unwrap_or(track.wake_dist);
+          track.rest_dist = from_rest.unwrap_or(track.rest_dist);
           track.moving_streak += 1;
           // waking opens a span: the tick that completes it has to be strong
           if track.moving_streak >= self.config.wake_ticks && strong {
@@ -535,14 +561,20 @@ impl CameraWorld {
             track.still_since_ms = t_ms;
             track.moving_streak = 0;
             track.wake_dist = 0.0;
+            track.rest_dist = 0.0;
             events.push(SemanticEvent::ObjectWoke(snapshot(world_id, track)));
           }
         } else {
           track.moving_streak = 0;
           track.wake_dist = 0.0;
+          track.rest_dist = 0.0;
           // drift correction only at rest, so a departing box can't drag the anchor along
           if !moving && anchor_iou >= 0.6 {
             track.anchor = bbox;
+            track.anchor_seen = true;
+          }
+          if !moving {
+            track.rest = bbox;
           }
         }
       } else {
@@ -558,6 +590,7 @@ impl CameraWorld {
         if t_ms - track.still_since_ms >= settle_ms {
           track.state = TrackState::Stationary;
           track.anchor = bbox;
+          track.anchor_seen = true;
           events.push(SemanticEvent::ObjectSettled(snapshot(world_id, track)));
         }
       }
@@ -629,11 +662,18 @@ impl CameraWorld {
           || track.bbox[0] + track.bbox[2] >= 0.99
           || track.bbox[1] + track.bbox[3] >= 0.99;
         let traveled_out = track.state != TrackState::Stationary && at_edge && travel >= reach;
+        // a walker close to the camera has a box too large to ever travel its
+        // own diagonal and fades before the border: its velocity carries it out
+        let heading_out = {
+          let cx = track.bbox[0] + track.bbox[2] / 2.0 + track.velocity_s.0;
+          let cy = track.bbox[1] + track.bbox[3] / 2.0 + track.velocity_s.1;
+          !(0.0..=1.0).contains(&cx) || !(0.0..=1.0).contains(&cy)
+        };
         let was_still = !traveled_out
           && (track.still_since_ms == track.first_seen_ms
             || track.last_seen_ms - track.still_since_ms >= depart_grace_ms
             || track.speed < self.config.stationary_speed * 2.0
-            || travel < reach);
+            || (travel < reach && !heading_out));
         if was_still || track.state == TrackState::Stationary {
           // a track that faded without ever going anywhere is scenery caught
           // in detector flickers, not a visitor: settle it the moment the hold
@@ -642,6 +682,8 @@ impl CameraWorld {
           if track.state != TrackState::Stationary && travel < reach * 0.5 {
             track.state = TrackState::Stationary;
             track.anchor = track.bbox;
+            track.anchor_seen = false;
+            track.rest = track.bbox;
             events.push(SemanticEvent::ObjectSettled(snapshot(*id, track)));
           }
           // a still object that fades mid-frame is still there, the detector
@@ -1097,6 +1139,213 @@ mod tests {
       .iter()
       .any(|e| matches!(e.kind(), "objectEntered" | "objectWoke" | "objectRecovered")));
     assert!(up.tracked.iter().all(|t| t.state == TrackState::Stationary));
+  }
+
+  #[test]
+  fn a_walker_close_to_the_camera_leaves_instead_of_lending_its_identity() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    // the detector drops him before his box, longer than the walk across, reaches the border
+    let mut t = 0.0;
+    let mut id = None;
+    for i in 0..12 {
+      let walker = box_at(0.08 + i as f32 * 0.055, 0.24, 0.24, 0.75, "person");
+      let up = world.ingest(t, &[walker], None);
+      id = id.or(up.tracked.first().map(|s| s.track_id));
+      t += 200.0;
+    }
+    let id = id.expect("confirmed");
+    let mut departed = false;
+    while t < 37_000.0 {
+      let up = world.ingest(t, &[], None);
+      departed |= up.events.iter().any(|e| e.kind() == "objectDeparted");
+      t += 500.0;
+    }
+    assert!(departed, "the walker left the frame");
+    // half a minute later someone else steps in at the right edge
+    let mut stranger = box_at(0.85, 0.10, 0.14, 0.89, "person");
+    stranger.confidence = 0.58;
+    let up = world.ingest(t, &[stranger], None);
+    assert!(
+      up.tracked.iter().all(|s| s.track_id != id),
+      "the stranger continued the walker's identity"
+    );
+  }
+
+  #[test]
+  fn two_people_crossing_under_one_box_keep_their_identities() {
+    // while their centers are close the detector draws one box around both and
+    // may miss a few frames: after the crossing each walker must keep its own id
+    let mut swapped = Vec::new();
+    for speed in [0.004f32, 0.008, 0.012, 0.02] {
+      for width in [0.08f32, 0.12] {
+        for near in [0.6f32, 1.0, 1.4] {
+          for misses in [0, 3, 6] {
+            for dy in [0.0f32, 0.05] {
+              let mut world = CameraWorld::new(WorldConfig::default());
+              world.set_min_confidence(0.5);
+              let person = |x: f32, y: f32, w: f32, h: f32, confidence: f32| {
+                let mut d = box_at(x, y, w, h, "person");
+                d.confidence = confidence;
+                d
+              };
+              let (height, ya, yb) = (0.32f32, 0.3f32, 0.3 + dy);
+              let (mut ax, mut bx) = (0.2f32, 0.8 - width);
+              let mut t = 1_000_000.0;
+              let mut merged = 0;
+              let mut first: Option<(u32, u32)> = None;
+              let mut ingest = |world: &mut CameraWorld, t: f64, dets: &[Detection]| {
+                let mut ids: Vec<(f32, u32)> = world
+                  .ingest(t, dets, None)
+                  .tracked
+                  .iter()
+                  .map(|s| (s.x, s.track_id))
+                  .collect();
+                ids.sort_by(|a, b| a.0.total_cmp(&b.0));
+                ids
+              };
+              while ax < 0.8 - width && bx > 0.2 {
+                let dets = if ((ax - bx).abs()) < width * near {
+                  merged += 1;
+                  let (gx, gy) = (ax.min(bx), ya.min(yb));
+                  let group = person(
+                    gx,
+                    gy,
+                    ax.max(bx) + width - gx,
+                    ya.max(yb) + height - gy,
+                    0.7,
+                  );
+                  if merged > 1 && merged <= 1 + misses {
+                    vec![]
+                  } else {
+                    vec![group]
+                  }
+                } else {
+                  vec![
+                    person(ax, ya, width, height, 0.8),
+                    person(bx, yb, width, height, 0.8),
+                  ]
+                };
+                let ids = ingest(&mut world, t, &dets);
+                if first.is_none() && ids.len() == 2 {
+                  first = Some((ids[0].1, ids[1].1));
+                }
+                t += 150.0;
+                ax += speed;
+                bx -= speed;
+              }
+              let mut last = Vec::new();
+              for _ in 0..10 {
+                let dets = [
+                  person(ax, ya, width, height, 0.8),
+                  person(bx, yb, width, height, 0.8),
+                ];
+                last = ingest(&mut world, t, &dets);
+                t += 150.0;
+                ax = (ax + speed).min(0.9 - width);
+                bx = (bx - speed).max(0.02);
+              }
+              let (left_first, right_first) = first.expect("both confirmed before they met");
+              // the one who started left ends on the right
+              if last.len() != 2 || last[1].1 != left_first || last[0].1 != right_first {
+                swapped.push((speed, width, near, misses, dy));
+              }
+            }
+          }
+        }
+      }
+    }
+    assert!(
+      swapped.is_empty(),
+      "crossings that lost or swapped an identity: {swapped:?}"
+    );
+  }
+
+  #[test]
+  fn a_round_trip_settled_as_scenery_wakes_when_she_walks_off() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let at = |b: [f32; 4]| box_at(b[0], b[1], b[2], b[3], "person");
+    let lerp =
+      |a: [f32; 4], b: [f32; 4], f: f32| at(std::array::from_fn(|i| a[i] + (b[i] - a[i]) * f));
+    // from the trolley to the door and back, stopping beside the trolley
+    let trolley_side = [0.25, 0.30, 0.15, 0.44];
+    let door = [0.60, 0.11, 0.23, 0.58];
+    let transit = [0.32, 0.34, 0.16, 0.64];
+    let mut t = 0.0;
+    let mut id = None;
+    for leg in [(trolley_side, door), (door, transit)] {
+      for i in 0..15 {
+        let up = world.ingest(t, &[lerp(leg.0, leg.1, i as f32 / 14.0)], None);
+        id = id.or(up.tracked.first().map(|s| s.track_id));
+        t += 200.0;
+      }
+    }
+    for _ in 0..3 {
+      world.ingest(t, &[at(transit)], None);
+      t += 200.0;
+    }
+    let id = id.expect("confirmed");
+    // crouched at the trolley, unseen long enough for the fade to settle her
+    let mut settled = false;
+    while t < 13_000.0 {
+      let up = world.ingest(t, &[], None);
+      settled |= up.events.iter().any(|e| e.kind() == "objectSettled");
+      t += 500.0;
+    }
+    assert!(settled, "the round trip reads as scenery");
+    let crouched = [0.12, 0.75, 0.21, 0.24];
+    for _ in 0..8 {
+      let up = world.ingest(t, &[at(crouched)], None);
+      assert_eq!(up.tracked.first().map(|s| s.track_id), Some(id));
+      assert!(!kinds(&up).contains(&"objectWoke"), "a crouch is no walk");
+      t += 500.0;
+    }
+    // she walks off, never farther from the transit box than half its height
+    let away = [0.41, 0.20, 0.16, 0.74];
+    let mut states = Vec::new();
+    for i in 1..=10 {
+      let up = world.ingest(t, &[lerp(crouched, away, i as f32 / 10.0)], None);
+      states.extend(
+        up.tracked
+          .iter()
+          .filter(|s| s.track_id == id)
+          .map(|s| s.state),
+      );
+      t += 200.0;
+    }
+    assert_eq!(
+      states.last(),
+      Some(&TrackState::Active),
+      "a walker held as scenery: {states:?}"
+    );
+  }
+
+  #[test]
+  fn a_faded_sitter_uncovered_by_a_passer_by_stays_put() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    for _ in 0..6 {
+      world.ingest(t, &[box_at(0.40, 0.25, 0.12, 0.30, "person")], None);
+      t += 200.0;
+    }
+    while t < 8_000.0 {
+      world.ingest(t, &[], None);
+      t += 500.0;
+    }
+    // a passer-by hides all but the head, then uncovers the rest of the body
+    let mut woke = 0;
+    for i in 0..28 {
+      let shown = 0.13 + 0.87 * (i as f32 - 5.0).clamp(0.0, 16.0) / 16.0;
+      let seen = box_at(0.40, 0.25, 0.12, 0.30 * shown, "person");
+      let up = world.ingest(t, &[seen], None);
+      woke += up
+        .events
+        .iter()
+        .filter(|e| e.kind() == "objectWoke")
+        .count();
+      t += 200.0;
+    }
+    assert_eq!(woke, 0, "a sitter uncovered in place woke");
   }
 
   #[test]
