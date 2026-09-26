@@ -938,6 +938,7 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     width: t.bbox[2],
     height: t.bbox[3],
     confidence: t.confidence,
+    score: t.score,
     speed: t.speed_s,
     velocity_x: t.velocity_s.0,
     velocity_y: t.velocity_s.1,
@@ -1736,6 +1737,10 @@ mod tests {
         assert_eq!(
           up.tracked[0].confidence, 0.8,
           "a weak tick reported its own score"
+        );
+        assert_eq!(
+          up.tracked[0].score, 0.35,
+          "the weak tick's own sighting got lost"
         );
       }
     }

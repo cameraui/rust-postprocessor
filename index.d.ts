@@ -111,6 +111,7 @@ export interface WorldObject {
   width: number
   height: number
   confidence: number
+  score: number
   speed: number
   velocityX: number
   velocityY: number

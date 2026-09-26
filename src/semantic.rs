@@ -20,6 +20,8 @@ pub struct TrackSnapshot {
   pub width: f32,
   pub height: f32,
   pub confidence: f32,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub score: f32,
   pub speed: f32,
   pub velocity_x: f32,
   pub velocity_y: f32,
