@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use trackforge::trackers::byte_track::ByteTrack;
 
@@ -18,6 +18,8 @@ const ASSOCIATION_FLOOR: f32 = 0.1;
 const ORPHAN_MS: f64 = 1_500.0;
 const ATTEST_WINDOW_MS: f64 = 3_000.0;
 const ENGINE_SPLIT: f32 = 0.5;
+const DEPTH_WINDOW_MS: f64 = 1_000.0;
+const DEPTH_STEP: f32 = 0.12;
 
 pub struct WorldUpdate {
   pub tracked: Vec<TrackSnapshot>,
@@ -86,6 +88,10 @@ struct WorldTrack {
   // still logic keeps its per-tick scale, tuned on replays
   speed_s: f32,
   velocity_s: (f32, f32),
+  // recent box sizes, and since when (and which way) every sighting found both
+  // sides scaled past DEPTH_STEP in each of the last two windows
+  sizes: VecDeque<(f64, f32, f32)>,
+  scaling: Option<(f64, f32)>,
   state: TrackState,
   still_since_ms: f64,
   last_seen_ms: f64,
@@ -412,6 +418,8 @@ impl CameraWorld {
                 velocity: (0.0, 0.0),
                 speed_s: 0.0,
                 velocity_s: (0.0, 0.0),
+                sizes: VecDeque::new(),
+                scaling: None,
                 state: TrackState::Tentative,
                 still_since_ms: t_ms,
                 last_seen_ms: t_ms,
@@ -518,6 +526,23 @@ impl CameraWorld {
       }
       track.bbox = bbox;
       track.last_seen_ms = t_ms;
+      track
+        .sizes
+        .retain(|(at, _, _)| t_ms - at <= DEPTH_WINDOW_MS * 3.0);
+      // a view swap jumps in one window, a body in depth motion keeps scaling
+      // the same way through both
+      let step = size_before(&track.sizes, t_ms).and_then(|(then, w, h)| {
+        let recent = depth_scale((w, h), (bbox[2], bbox[3]))?;
+        let (_, w0, h0) = size_before(&track.sizes, then)?;
+        let earlier = depth_scale((w0, h0), (w, h))?;
+        (recent * earlier > 0.0 && recent.abs().min(earlier.abs()) >= DEPTH_STEP).then_some(recent)
+      });
+      track.scaling = match (step, track.scaling) {
+        (Some(s), Some((since, sign))) if s.signum() == sign => Some((since, sign)),
+        (Some(s), _) => Some((t_ms, s.signum())),
+        _ => None,
+      };
+      track.sizes.push_back((t_ms, bbox[2], bbox[3]));
 
       let moving = track.speed >= self.config.stationary_speed;
       if track.state == TrackState::Stationary {
@@ -551,19 +576,18 @@ impl CameraWorld {
           } else {
             leaves(&track.rest, track.rest_dist)
           };
+        // walking in depth scales the box away from the size it rested at while the
+        // center stays; a partial view growing back over the body scales toward it
+        let size = (bbox[2], bbox[3]);
+        let in_depth = track.scaling.is_some_and(|(since, sign)| {
+          t_ms - since >= DEPTH_WINDOW_MS / 2.0
+            && depth_scale((track.anchor[2], track.anchor[3]), size)
+              .is_some_and(|s| s * sign >= DEPTH_STEP)
+        });
         if moving && (from_anchor.is_some() || from_rest.is_some()) {
           track.wake_dist = from_anchor.unwrap_or(track.wake_dist);
           track.rest_dist = from_rest.unwrap_or(track.rest_dist);
           track.moving_streak += 1;
-          // waking opens a span: the tick that completes it has to be strong
-          if track.moving_streak >= self.config.wake_ticks && strong {
-            track.state = TrackState::Active;
-            track.still_since_ms = t_ms;
-            track.moving_streak = 0;
-            track.wake_dist = 0.0;
-            track.rest_dist = 0.0;
-            events.push(SemanticEvent::ObjectWoke(snapshot(world_id, track)));
-          }
         } else {
           track.moving_streak = 0;
           track.wake_dist = 0.0;
@@ -576,6 +600,15 @@ impl CameraWorld {
           if !moving {
             track.rest = bbox;
           }
+        }
+        // waking opens a span: the tick that completes it has to be strong
+        if (track.moving_streak >= self.config.wake_ticks || in_depth) && strong {
+          track.state = TrackState::Active;
+          track.still_since_ms = t_ms;
+          track.moving_streak = 0;
+          track.wake_dist = 0.0;
+          track.rest_dist = 0.0;
+          events.push(SemanticEvent::ObjectWoke(snapshot(world_id, track)));
         }
       } else {
         // stillness is position truth, not velocity noise: the still clock only
@@ -669,7 +702,17 @@ impl CameraWorld {
           let cy = track.bbox[1] + track.bbox[3] / 2.0 + track.velocity_s.1;
           !(0.0..=1.0).contains(&cx) || !(0.0..=1.0).contains(&cy)
         };
+        // walking at the camera grows the box into the border, the center stays: grown since
+        // confirmation and still growing when it faded at an edge means it passed the camera
+        let size = (track.bbox[2], track.bbox[3]);
+        let approached_out = track.state != TrackState::Stationary
+          && at_edge
+          && depth_scale((track.origin[2], track.origin[3]), size).is_some_and(|s| s >= DEPTH_STEP)
+          && size_before(&track.sizes, track.last_seen_ms)
+            .and_then(|(_, w, h)| depth_scale((w, h), size))
+            .is_some_and(|s| s >= DEPTH_STEP);
         let was_still = !traveled_out
+          && !approached_out
           && (track.still_since_ms == track.first_seen_ms
             || track.last_seen_ms - track.still_since_ms >= depart_grace_ms
             || track.speed < self.config.stationary_speed * 2.0
@@ -950,6 +993,23 @@ fn animate(label: &str) -> bool {
   matches!(label, "person" | "animal")
 }
 
+fn size_before(sizes: &VecDeque<(f64, f32, f32)>, at: f64) -> Option<(f64, f32, f32)> {
+  sizes
+    .iter()
+    .rev()
+    .find(|(seen, _, _)| at - seen >= DEPTH_WINDOW_MS)
+    .copied()
+}
+
+fn depth_scale(from: (f32, f32), to: (f32, f32)) -> Option<f32> {
+  if from.0 <= 0.0 || from.1 <= 0.0 || to.0 <= 0.0 || to.1 <= 0.0 {
+    return None;
+  }
+  let (sw, sh) = ((to.0 / from.0).ln(), (to.1 / from.1).ln());
+  let (small, large) = (sw.abs().min(sh.abs()), sw.abs().max(sh.abs()));
+  (sw * sh > 0.0 && small * 3.0 >= large).then_some(small.copysign(sw))
+}
+
 fn center_inside(of: &[f32; 4], within: &[f32; 4]) -> bool {
   let cx = of[0] + of[2] / 2.0;
   let cy = of[1] + of[3] / 2.0;
@@ -1194,7 +1254,7 @@ mod tests {
               let mut t = 1_000_000.0;
               let mut merged = 0;
               let mut first: Option<(u32, u32)> = None;
-              let mut ingest = |world: &mut CameraWorld, t: f64, dets: &[Detection]| {
+              let ingest = |world: &mut CameraWorld, t: f64, dets: &[Detection]| {
                 let mut ids: Vec<(f32, u32)> = world
                   .ingest(t, dets, None)
                   .tracked
@@ -1346,6 +1406,231 @@ mod tests {
       t += 200.0;
     }
     assert_eq!(woke, 0, "a sitter uncovered in place woke");
+  }
+
+  fn lerp_box(a: [f32; 4], b: [f32; 4], f: f32) -> Detection {
+    let b: [f32; 4] = std::array::from_fn(|i| a[i] + (b[i] - a[i]) * f);
+    box_at(b[0], b[1], b[2], b[3], "person")
+  }
+
+  #[test]
+  fn a_walker_coming_at_the_camera_leaves_instead_of_settling() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.5);
+    // in through the door on the right, straight at the camera: the box grows,
+    // its center hardly moves, the feet leave the frame at the bottom
+    let door = [0.90, 0.37, 0.084, 0.49];
+    let close = [0.84, 0.24, 0.14, 0.76];
+    let mut t = 0.0;
+    let mut id = None;
+    for i in 0..12 {
+      let up = world.ingest(t, &[lerp_box(door, close, i as f32 / 11.0)], None);
+      id = id.or(up.tracked.first().map(|s| s.track_id));
+      t += 200.0;
+    }
+    let id = id.expect("confirmed");
+    let (mut departed, mut settled) = (false, false);
+    while t < 37_000.0 {
+      let up = world.ingest(t, &[], None);
+      departed |= kinds(&up).contains(&"objectDeparted");
+      settled |= kinds(&up).contains(&"objectSettled");
+      t += 500.0;
+    }
+    assert!(
+      departed && !settled,
+      "she passed the camera, she is no scenery"
+    );
+    // back at the same edge half a minute later, walking into the room
+    let back = [0.889, 0.195, 0.110, 0.794];
+    let room = [0.899, 0.381, 0.073, 0.464];
+    let mut seen = Vec::new();
+    for i in 0..25 {
+      let up = world.ingest(t, &[lerp_box(back, room, i as f32 / 24.0)], None);
+      seen.extend(up.tracked.iter().map(|s| (s.track_id, s.state)));
+      t += 200.0;
+    }
+    assert!(
+      !seen.is_empty()
+        && seen
+          .iter()
+          .all(|(sid, state)| *sid != id && *state == TrackState::Active),
+      "her return is a held still identity: {seen:?}"
+    );
+  }
+
+  #[test]
+  fn a_visitor_waiting_close_at_the_edge_is_held() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // walks up to the door, then waits there cut off at the bottom
+    let path = [0.40, 0.30, 0.10, 0.30];
+    let door = [0.36, 0.30, 0.20, 0.70];
+    let mut t = 0.0;
+    let mut id = None;
+    for i in 0..12 {
+      let up = world.ingest(t, &[lerp_box(path, door, i as f32 / 11.0)], None);
+      id = id.or(up.tracked.first().map(|s| s.track_id));
+      t += 200.0;
+    }
+    for i in 0..40 {
+      let jitter = if i % 2 == 0 { 0.0 } else { 0.004 };
+      let waiting = [door[0] + jitter, door[1], door[2] - jitter, door[3]];
+      world.ingest(t, &[lerp_box(waiting, waiting, 0.0)], None);
+      t += 200.0;
+    }
+    // the detector loses him for a while, he is still at the door
+    let resumed = t + 20_000.0;
+    while t < resumed {
+      let up = world.ingest(t, &[], None);
+      assert!(
+        !kinds(&up).contains(&"objectDeparted"),
+        "a visitor waiting at the door left"
+      );
+      t += 500.0;
+    }
+    let up = world.ingest(t, &[lerp_box(door, door, 0.0)], None);
+    assert_eq!(up.tracked.first().map(|s| s.track_id), id);
+  }
+
+  #[test]
+  fn a_view_growing_back_at_the_edge_before_a_fade_is_no_leaver() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // leaning on the window at the top edge, seen head only for a moment, the
+    // box growing back over the body, then lost for a while
+    let body = [0.63, 0.0, 0.235, 0.53];
+    let head = [0.80, 0.011, 0.064, 0.247];
+    let mut t = 0.0;
+    for _ in 0..15 {
+      world.ingest(t, &[lerp_box(body, body, 0.0)], None);
+      t += 200.0;
+    }
+    for i in 0..=8 {
+      world.ingest(t, &[lerp_box(head, body, i as f32 / 8.0)], None);
+      t += 200.0;
+    }
+    while t < 30_000.0 {
+      let up = world.ingest(t, &[], None);
+      assert!(
+        !kinds(&up).contains(&"objectDeparted"),
+        "a view growing back read as walking at the camera"
+      );
+      t += 500.0;
+    }
+  }
+
+  #[test]
+  fn a_settled_person_walking_away_from_the_camera_wakes() {
+    let config = WorldConfig::default();
+    let mut world = CameraWorld::new(WorldConfig::default());
+    // stands close to the camera long enough to settle
+    let near = [0.84, 0.23, 0.16, 0.76];
+    let mut t = 0.0;
+    while t <= config.settle_person_ms + 1_000.0 {
+      world.ingest(t, &[lerp_box(near, near, 0.0)], None);
+      t += 200.0;
+    }
+    assert!(world
+      .tracks
+      .values()
+      .all(|tr| tr.state == TrackState::Stationary));
+    // then walks straight into the room: the box shrinks, the center stays
+    let far = [0.90, 0.38, 0.06, 0.38];
+    let mut states = Vec::new();
+    for i in 1..=20 {
+      let up = world.ingest(t, &[lerp_box(near, far, i as f32 / 20.0)], None);
+      states.extend(up.tracked.iter().map(|s| s.state));
+      t += 200.0;
+    }
+    assert_eq!(
+      states.last(),
+      Some(&TrackState::Active),
+      "a walker held as scenery: {states:?}"
+    );
+  }
+
+  #[test]
+  fn a_settled_photo_or_a_view_flap_never_wakes() {
+    let config = WorldConfig::default();
+    let settle = |world: &mut CameraWorld, b: [f32; 4]| {
+      let mut t = 0.0;
+      while t <= config.settle_person_ms + 1_000.0 {
+        world.ingest(t, &[lerp_box(b, b, 0.0)], None);
+        t += 100.0;
+      }
+      t
+    };
+    let woke = |up: &WorldUpdate| kinds(up).contains(&"objectWoke");
+
+    // a framed photo read as a person: its box size jumps between detector
+    // views for minutes and never goes anywhere
+    let photo = [0.33, 0.35, 0.116, 0.284];
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle(&mut world, photo);
+    let mut seed = 7u32;
+    let mut next = || {
+      seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let (mut w, mut h, mut hold) = (photo[2], photo[3], 0);
+    for _ in 0..3_000 {
+      if hold == 0 {
+        w = 0.081 + 0.061 * next();
+        h = 0.264 + 0.044 * next();
+        hold = 1 + (next() * 20.0) as u32;
+      }
+      hold -= 1;
+      let seen = [photo[0], photo[1], w, h];
+      assert!(!woke(&world.ingest(t, &[lerp_box(seen, seen, 0.0)], None)));
+      t += 100.0;
+    }
+
+    // a sitter seen head only, the box growing back over the body for a few
+    // seconds, and a view that swaps to a larger box once and stays there
+    let body = [0.63, 0.015, 0.235, 0.53];
+    let head = [0.80, 0.011, 0.064, 0.247];
+    let wide = [0.60, 0.0, 0.33, 0.74];
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle(&mut world, body);
+    let sitter: Vec<u32> = world.tracks.keys().copied().collect();
+    for _ in 0..3 {
+      for i in 0..=25 {
+        let up = world.ingest(t, &[lerp_box(head, body, i as f32 / 25.0)], None);
+        assert!(!woke(&up), "a view growing back over the body woke");
+        let ids: Vec<u32> = up.tracked.iter().map(|s| s.track_id).collect();
+        assert_eq!(ids, sitter, "the flap left the sitter's identity");
+        t += 100.0;
+      }
+      for _ in 0..30 {
+        assert!(!woke(&world.ingest(t, &[lerp_box(body, body, 0.0)], None)));
+        t += 100.0;
+      }
+    }
+    for _ in 0..50 {
+      let up = world.ingest(t, &[lerp_box(wide, wide, 0.0)], None);
+      assert!(!woke(&up), "a view swap woke");
+      t += 100.0;
+    }
+
+    // bends down, straightens up, and one box takes in the person beside her
+    let standing = [0.50, 0.35, 0.25, 0.55];
+    let bent = [0.50, 0.45, 0.246, 0.505];
+    let rising = [0.50, 0.40, 0.307, 0.596];
+    let group = [0.54, 0.15, 0.36, 0.85];
+    let beside = [0.61, 0.19, 0.27, 0.53];
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle(&mut world, standing);
+    let seen = |world: &mut CameraWorld, b: [f32; 4], n: usize, t: &mut f64| {
+      for _ in 0..n {
+        assert!(
+          !woke(&world.ingest(*t, &[lerp_box(b, b, 0.0)], None)),
+          "one group box woke her"
+        );
+        *t += 200.0;
+      }
+    };
+    seen(&mut world, bent, 10, &mut t);
+    seen(&mut world, rising, 5, &mut t);
+    seen(&mut world, group, 1, &mut t);
+    seen(&mut world, beside, 15, &mut t);
   }
 
   #[test]
