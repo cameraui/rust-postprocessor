@@ -28,3 +28,7 @@ eslint.config.js
 .yarnrc
 .yarnrc.yml
 *.toml
+.vscode
+scripts
+.gitmodules
+externals
