@@ -119,6 +119,12 @@ export interface WorldObject {
   stationarySinceMs?: number
   lastSeenMs: number
   attested: boolean
+  wakeCause?: string
+  anchorDistance?: number
+  farFromAnchor?: boolean
+  handover?: string
+  handoverTier?: string
+  unseenMs?: number
 }
 
 export declare const enum ZoneFilterMode {

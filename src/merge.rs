@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::types::Detection;
 
 const FRAGMENT_SHARE: f32 = 0.9;
@@ -25,9 +23,14 @@ pub fn merge_detections_contained(
     return Vec::new();
   }
 
-  let mut by_label: HashMap<String, Vec<usize>> = HashMap::new();
+  // in input order, labels by first appearance: the tracker numbers new tracks in
+  // the order the detections reach it, a hash order differs between processes
+  let mut by_label: Vec<(String, Vec<usize>)> = Vec::new();
   for (i, det) in detections.iter().enumerate() {
-    by_label.entry(det.label.clone()).or_default().push(i);
+    match by_label.iter_mut().find(|(label, _)| *label == det.label) {
+      Some((_, indices)) => indices.push(i),
+      None => by_label.push((det.label.clone(), vec![i])),
+    }
   }
 
   let mut result: Vec<Detection> = Vec::with_capacity(detections.len());
@@ -154,13 +157,19 @@ fn merge_cluster(
     }
   }
 
-  let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+  // clusters by their first member
+  let mut slot = vec![usize::MAX; n];
+  let mut clusters: Vec<Vec<usize>> = Vec::new();
   for i in 0..n {
     let root = find(&mut parent, i);
-    clusters.entry(root).or_default().push(i);
+    if slot[root] == usize::MAX {
+      slot[root] = clusters.len();
+      clusters.push(Vec::new());
+    }
+    clusters[slot[root]].push(i);
   }
 
-  for (_root, members) in clusters {
+  for members in clusters {
     if members.len() == 1 {
       out.push(detections[indices[members[0]]].clone());
       continue;
@@ -333,7 +342,7 @@ mod tests {
 
   #[test]
   fn contained_label_merges_a_small_fragment_cut_at_a_seam() {
-    // hof: the legs below a window edge and a crouching child's head, both
+    // hof: the legs below a window edge and the head of someone crouching, both
     // far below iou 0.3 but on the body's bottom or top edge
     let people = vec!["person".to_string()];
     let legs = vec![
@@ -383,5 +392,36 @@ mod tests {
       merge_detections_contained(input, 0.3, 0.0, &people, 0.85).len(),
       1
     );
+  }
+
+  #[test]
+  fn hands_on_apart_boxes_label_by_label_in_input_order() {
+    // interleaved the way the detector sorts by confidence
+    let labels = [
+      "person", "vehicle", "person", "animal", "dog", "vehicle", "cat", "person", "bicycle",
+    ];
+    let scene: Vec<Detection> = labels
+      .iter()
+      .enumerate()
+      .map(|(i, label)| {
+        det(
+          0.02 + (i % 3) as f32 * 0.3,
+          0.05 + (i / 3) as f32 * 0.3,
+          0.05,
+          0.05,
+          0.9,
+          label,
+        )
+      })
+      .collect();
+    let expected: Vec<f32> = [0, 2, 7, 1, 5, 3, 4, 6, 8]
+      .iter()
+      .map(|&i| scene[i].x + scene[i].y)
+      .collect();
+    for _ in 0..10 {
+      let merged = merge_detections(scene.clone(), 0.5, 0.0);
+      let got: Vec<f32> = merged.iter().map(|d| d.x + d.y).collect();
+      assert_eq!(got, expected);
+    }
   }
 }

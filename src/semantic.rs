@@ -9,6 +9,32 @@ pub enum TrackState {
   Departed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "replay", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "replay", serde(rename_all = "camelCase"))]
+pub enum WakeCause {
+  Travel,
+  Depth,
+  Oscillation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "replay", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "replay", serde(rename_all = "camelCase"))]
+pub enum Handover {
+  Recovered,
+  Reassociated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "replay", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "replay", serde(rename_all = "camelCase"))]
+pub enum MatchTier {
+  Overlap,
+  Contained,
+  Near,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "replay", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "replay", serde(rename_all = "camelCase"))]
@@ -32,6 +58,20 @@ pub struct TrackSnapshot {
   pub last_seen_ms: f64,
   #[cfg_attr(feature = "replay", serde(default))]
   pub attested: bool,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub wake_cause: Option<WakeCause>,
+  // wake box centre to the anchor centre, in anchor sizes
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub anchor_distance: Option<f32>,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub far_from_anchor: Option<bool>,
+  // only on the tick a re-association bound the identity to a new engine track
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub handover: Option<Handover>,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub handover_tier: Option<MatchTier>,
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub unseen_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

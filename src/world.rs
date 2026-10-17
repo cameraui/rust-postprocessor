@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use trackforge::trackers::byte_track::ByteTrack;
 
@@ -7,12 +7,14 @@ use crate::line_crossing::{
   prepare_lines, segment_intersection, CrossingDirection, DetectionLineInput, LineCrossingEvent,
   LineDirectionFilter, PreparedLine,
 };
-use crate::semantic::{SemanticEvent, TrackSnapshot, TrackState};
+use crate::semantic::{Handover, MatchTier, SemanticEvent, TrackSnapshot, TrackState, WakeCause};
 use crate::types::Detection;
 use crate::zone_filter::{filter_indices, prepare_zones, PreparedZones, ZoneInput};
 
-// (world id, label, prev centroid, curr centroid) of one tick's movement
-type TrackSegment = (u32, String, (f32, f32), (f32, f32));
+// a box center and its size
+type Sighting = ((f32, f32), (f32, f32));
+// (world id, label, prev and curr sighting) of one tick's movement
+type TrackSegment = (u32, String, Sighting, Sighting);
 
 const ASSOCIATION_FLOOR: f32 = 0.1;
 const ORPHAN_MS: f64 = 1_500.0;
@@ -20,6 +22,11 @@ const ATTEST_WINDOW_MS: f64 = 3_000.0;
 const ENGINE_SPLIT: f32 = 0.5;
 const DEPTH_WINDOW_MS: f64 = 1_000.0;
 const DEPTH_STEP: f32 = 0.12;
+const FAR_FROM_ANCHOR: f32 = 1.0;
+// moving in place is weaker evidence than travel: it needs a detection clearly above the threshold
+const SURE_MARGIN: f32 = 0.05;
+// a center closer to a line than this share of its box's extent across it is on neither side
+const LINE_DEAD_BAND: f32 = 0.1;
 
 pub struct WorldUpdate {
   pub tracked: Vec<TrackSnapshot>,
@@ -101,13 +108,23 @@ struct WorldTrack {
   dormant: bool,
   slow_confirm: bool,
   wake_dist: f32,
+  // times the box cleared its spot since it last rested there
+  departures: u32,
+  departure_counted: bool,
+  away: bool,
+  rest_seen: u32,
+  // when another body last showed up where this one went out of sight
+  covered_ms: f64,
   confirmed_by_witness: bool,
+  // per line, the last sighting clearly on one side of it
+  line_sides: HashMap<u32, Sighting>,
 }
 
 pub struct CameraWorld {
   config: WorldConfig,
   engine: ByteTrack,
-  tracks: HashMap<u32, WorldTrack>,
+  // in id order: events, output and every first-found rule come out the same in every process
+  tracks: BTreeMap<u32, WorldTrack>,
   engine_map: HashMap<u32, u32>,
   next_id: u32,
   last_t_ms: f64,
@@ -132,7 +149,7 @@ impl CameraWorld {
     Self {
       config,
       engine: new_engine(ENGINE_SPLIT),
-      tracks: HashMap::new(),
+      tracks: BTreeMap::new(),
       engine_map: HashMap::new(),
       next_id: 1,
       last_t_ms: 0.0,
@@ -197,6 +214,9 @@ impl CameraWorld {
   pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, _aspect_ratio: f32) {
     self.prepared_lines = prepare_lines(&lines);
     self.crossing_memory.clear();
+    for track in self.tracks.values_mut() {
+      track.line_sides.clear();
+    }
   }
 
   pub fn notify_camera_move(&mut self) {
@@ -207,6 +227,9 @@ impl CameraWorld {
       .engine_map
       .retain(|_, world_id| self.tracks.contains_key(world_id));
     self.crossing_memory.clear();
+    for track in self.tracks.values_mut() {
+      track.line_sides.clear();
+    }
     self.pose_baseline = None;
   }
 
@@ -262,6 +285,12 @@ impl CameraWorld {
           track.rest[1] += dy;
           track.origin[0] += dx;
           track.origin[1] += dy;
+          // the spot is an estimate now, departures counted against the old one say nothing
+          forget_excursions(track);
+          for (center, _) in track.line_sides.values_mut() {
+            center.0 += dx;
+            center.1 += dy;
+          }
         }
         self.engine.forget_lost_motion();
         self.pose_moved_ms = t_ms;
@@ -298,6 +327,7 @@ impl CameraWorld {
 
     let mut seen: Vec<u32> = Vec::new();
     let mut claimed: HashSet<u32> = HashSet::new();
+    let mut handed: HashMap<u32, (Handover, MatchTier, f64)> = HashMap::new();
     let mut segments: Vec<TrackSegment> = Vec::new();
     let tick_detections = detections.clone();
     // continuations claim their identities before a newcomer may re-associate
@@ -314,7 +344,9 @@ impl CameraWorld {
         continue;
       };
       let bbox = t.tlwh;
-      let strong = t.score >= self.min_confidence_for(&label);
+      let min_confidence = self.min_confidence_for(&label);
+      let strong = t.score >= min_confidence;
+      let sure = t.score >= min_confidence + SURE_MARGIN;
 
       // a same-class passer-by steals a stationary track's engine identity the
       // moment their boxes overlap and drags it along. Two signatures: some
@@ -367,7 +399,7 @@ impl CameraWorld {
           // reopens a span when it resumes and a NEW identity starts one, both
           // need the user threshold
           let reassociated = self.reassociate(&label, &bbox, t_ms, &tick_detections);
-          let resumes_sleeper = reassociated.is_some_and(|id| self.tracks[&id].dormant);
+          let resumes_sleeper = reassociated.is_some_and(|(id, _)| self.tracks[&id].dormant);
           if (reassociated.is_none() || resumes_sleeper) && !strong {
             continue;
           }
@@ -383,7 +415,19 @@ impl CameraWorld {
           // a real rider (person + bicycle stacked) passes that bar easily
           let slow_confirm =
             reassociated.is_none() && self.contradicts_other_label(&label, &bbox, t_ms);
-          let id = reassociated.unwrap_or_else(|| {
+          // a tentative identity confirms on this tick at the earliest, nobody saw it to hand it over
+          if let Some((id, tier)) =
+            reassociated.filter(|(id, _)| self.tracks[id].state != TrackState::Tentative)
+          {
+            let track = &self.tracks[&id];
+            let kind = if track.dormant {
+              Handover::Recovered
+            } else {
+              Handover::Reassociated
+            };
+            handed.insert(id, (kind, tier, t_ms - track.last_seen_ms));
+          }
+          let id = reassociated.map(|(id, _)| id).unwrap_or_else(|| {
             #[cfg(feature = "replay")]
             if std::env::var("WORLD_DEBUG_BIRTH").is_ok() {
               eprintln!("BIRTH t={} label={} bbox={:?}", t_ms, label, bbox);
@@ -429,7 +473,13 @@ impl CameraWorld {
                 dormant: false,
                 slow_confirm,
                 wake_dist: 0.0,
+                departures: 0,
+                departure_counted: false,
+                away: false,
+                rest_seen: 0,
+                covered_ms: f64::NEG_INFINITY,
                 confirmed_by_witness: false,
+                line_sides: HashMap::new(),
               },
             );
             sightings.push(snapshot(born, &self.tracks[&born]));
@@ -442,11 +492,59 @@ impl CameraWorld {
           id
         }
       };
-      claimed.insert(world_id);
 
       let confirm_ms = self.config.confirm_ms;
       let settle_ms = self.settle_ms(&label);
       let attested = self.attested(&label, t_ms);
+      let label_id = self.label_ids.get(&label).copied();
+      // a newcomer that confirms on the spot of a body gone since before its
+      // birth is that body under a new engine track (someone who left the spot
+      // for a moment, a flicker on a parked car); one seen alongside it is someone else
+      let world_id = match self.tracks.get(&world_id) {
+        Some(track) if track.state == TrackState::Tentative => {
+          let wait = if track.slow_confirm {
+            confirm_ms * 4.0
+          } else {
+            confirm_ms
+          };
+          let confirms = (t_ms - track.first_seen_ms >= wait && strong) || attested;
+          let born = track.first_seen_ms;
+          let born_at = track.origin;
+          let reassoc_iou = self.config.reassoc_iou;
+          let held = confirms
+            .then(|| self.reassociate(&label, &bbox, t_ms, &tick_detections))
+            .flatten()
+            .filter(|(held, _)| {
+              let body = &self.tracks[held];
+              // a still body is found again where it stands, not by something that came from elsewhere
+              let stood_there = body.state != TrackState::Stationary
+                || [body.anchor, body.bbox]
+                  .iter()
+                  .any(|spot| spot_match(spot, &born_at, reassoc_iou).is_some());
+              body.state != TrackState::Tentative && body.last_seen_ms < born && stood_there
+            });
+          match held {
+            Some((held, tier)) => {
+              let body = &self.tracks[&held];
+              let kind = if body.dormant {
+                Handover::Recovered
+              } else {
+                Handover::Reassociated
+              };
+              handed.insert(held, (kind, tier, t_ms - body.last_seen_ms));
+              self.tracks.remove(&world_id);
+              self
+                .engine_map
+                .retain(|_, id| *id != held && *id != world_id);
+              self.engine_map.insert(engine_id, held);
+              held
+            }
+            None => world_id,
+          }
+        }
+        _ => world_id,
+      };
+      claimed.insert(world_id);
       let track = self.tracks.get_mut(&world_id).unwrap();
       if track.state == TrackState::Tentative {
         // an identity is persistence over time, independent of tick rate: a
@@ -488,10 +586,16 @@ impl CameraWorld {
         track.velocity_s = (0.0, 0.0);
         // time unseen says nothing about a person standing still: a walker who
         // comes back restarts the still clock instead of settling on arrival.
-        // A vehicle that drove in and is seen again on the same spot has parked
-        if track.state != TrackState::Stationary && animate(&track.label) {
+        // Back within the still grace the clock runs on, as it would have while
+        // held. A vehicle that drove in and is seen again on the same spot has parked
+        if track.state != TrackState::Stationary
+          && animate(&track.label)
+          && t_ms - track.last_seen_ms > self.config.still_lost_grace_ms
+        {
           track.still_since_ms = t_ms;
         }
+        // a side seen before the gap would turn the next step into a crossing across it
+        track.line_sides.clear();
       } else {
         // EMA over signed components so detector box jitter cancels out
         // instead of reading as perpetual movement; speed is the magnitude
@@ -514,11 +618,19 @@ impl CameraWorld {
       track.dormant = false;
       // a segment across a decode gap is not a movement, it is missing time
       if !was_dormant {
-        segments.push((world_id, label.clone(), (px, py), (cx, cy)));
+        segments.push((
+          world_id,
+          label.clone(),
+          ((px, py), (track.bbox[2], track.bbox[3])),
+          ((cx, cy), (bbox[2], bbox[3])),
+        ));
       } else {
         // resuming from sleep re-opens visibility; the snapshot carries the
         // state, consumers decide whether stationary scenery counts
-        events.push(SemanticEvent::ObjectRecovered(snapshot(world_id, track)));
+        events.push(SemanticEvent::ObjectRecovered(handed_over(
+          snapshot(world_id, track),
+          handed.get(&world_id),
+        )));
       }
       track.score = t.score;
       if strong {
@@ -601,14 +713,73 @@ impl CameraWorld {
             track.rest = bbox;
           }
         }
+        let (ax, ay) = center(&track.anchor);
+        let anchor_dist = ((cx - ax).powi(2) + (cy - ay).powi(2)).sqrt();
+        let mut oscillated = false;
+        if track.label == "person" {
+          // moving back and forth clears the spot and comes back without ever gaining distance; gestures
+          // and view flaps never clear it, and a body still on the spot means this identity
+          // rides someone else
+          let view = track.anchor[2]
+            .max(track.anchor[3])
+            .max(bbox[2])
+            .max(bbox[3]);
+          let out = anchor_iou < 0.15
+            && anchor_dist > view * 0.5
+            && !center_inside(&bbox, &track.anchor)
+            && !center_inside(&track.anchor, &bbox);
+          let at_home = center_inside(&bbox, &track.anchor) || anchor_iou >= 0.3;
+          let held = out
+            && tick_detections.iter().any(|(dbox, _, dlabel)| {
+              Some(*dlabel) == label_id && box_iou(dbox, &track.anchor) >= 0.3
+            });
+          if out && (sure || was_dormant) {
+            if !track.away {
+              track.away = true;
+              // only a departure seen happening counts: a body found outside after a
+              // sleep or a gap may have got there any way
+              let left = !held && !was_dormant;
+              track.departure_counted = left;
+              track.departures += u32::from(left);
+            } else if held && track.departure_counted {
+              track.departure_counted = false;
+              track.departures = track.departures.saturating_sub(1);
+            }
+          } else if at_home {
+            track.away = false;
+          }
+          track.rest_seen = if !moving && at_home {
+            track.rest_seen.saturating_add(1)
+          } else {
+            0
+          };
+          if track.rest_seen >= self.config.wake_ticks {
+            track.departures = 0;
+          }
+          oscillated = out && sure && !held && track.departures >= 2;
+        }
         // waking opens a span: the tick that completes it has to be strong
-        if (track.moving_streak >= self.config.wake_ticks || in_depth) && strong {
+        if (track.moving_streak >= self.config.wake_ticks || in_depth || oscillated) && strong {
+          let cause = if track.moving_streak >= self.config.wake_ticks {
+            WakeCause::Travel
+          } else if in_depth {
+            WakeCause::Depth
+          } else {
+            WakeCause::Oscillation
+          };
+          let anchor_distance =
+            anchor_dist / track.anchor[2].max(track.anchor[3]).max(f32::EPSILON);
           track.state = TrackState::Active;
           track.still_since_ms = t_ms;
           track.moving_streak = 0;
           track.wake_dist = 0.0;
           track.rest_dist = 0.0;
-          events.push(SemanticEvent::ObjectWoke(snapshot(world_id, track)));
+          forget_excursions(track);
+          let mut woke = snapshot(world_id, track);
+          woke.wake_cause = Some(cause);
+          woke.anchor_distance = Some(anchor_distance);
+          woke.far_from_anchor = Some(anchor_distance > FAR_FROM_ANCHOR);
+          events.push(SemanticEvent::ObjectWoke(woke));
         }
       } else {
         // stillness is position truth, not velocity noise: the still clock only
@@ -633,9 +804,31 @@ impl CameraWorld {
 
     let crossings = self.compute_crossings(&segments, t_ms);
 
+    let sighted: Vec<(u32, String, [f32; 4])> = seen
+      .iter()
+      .filter_map(|id| self.tracks.get(id).map(|t| (*id, t.label.clone(), t.bbox)))
+      .collect();
+    let reassoc_iou = self.config.reassoc_iou;
+    for (id, track) in self.tracks.iter_mut() {
+      if track.dormant
+        || track.state != TrackState::Active
+        || !animate(&track.label)
+        || seen.contains(id)
+      {
+        continue;
+      }
+      let covered = sighted.iter().any(|(other, label, bbox)| {
+        other != id && *label == track.label && spot_match(&track.bbox, bbox, reassoc_iou).is_some()
+      });
+      if covered {
+        track.covered_ms = t_ms;
+      }
+    }
+
     let mut removed = Vec::new();
     let mut removed_quiet = Vec::new();
     let depart_grace_ms = self.config.depart_grace_ms;
+    let still_lost_grace_ms = self.config.still_lost_grace_ms;
     let attestations = &self.attestations;
     // a track confirmed without being seen this tick: its sighting was
     // withheld until now, so it is delivered with this tick, dated by
@@ -718,22 +911,40 @@ impl CameraWorld {
             || track.speed < self.config.stationary_speed * 2.0
             || (travel < reach && !heading_out));
         if was_still || track.state == TrackState::Stationary {
-          // a track that faded without ever going anywhere is scenery caught
-          // in detector flickers, not a visitor: settle it the moment the hold
-          // starts, so its span closes now and re-sightings stay silent
-          // instead of stamping moving evidence for as long as the hold lasts
-          if track.state != TrackState::Stationary && travel < reach * 0.5 {
+          // a track that faded without ever moving is scenery caught in detector
+          // flickers, not a visitor: settle it the moment the hold starts, so its
+          // span closes now and re-sightings stay silent instead of stamping
+          // moving evidence for as long as the hold lasts. A body moved if its
+          // still clock restarted, travel can't tell: someone moving in place goes
+          // nowhere either. A vehicle that faded close to where it was confirmed
+          // has parked
+          let scenery = if animate(&track.label) {
+            track.still_since_ms == track.first_seen_ms
+          } else {
+            travel < reach * 0.5
+          };
+          if track.state != TrackState::Stationary && scenery {
             track.state = TrackState::Stationary;
             track.anchor = track.bbox;
             track.anchor_seen = false;
             track.rest = track.bbox;
             events.push(SemanticEvent::ObjectSettled(snapshot(*id, track)));
           }
+          // a body that moved and then vanished in the open is out of sight: its
+          // span closes now and a re-sighting recovers it. One that another body
+          // keeps showing up over is hidden behind it and stays
+          let hidden = t_ms - track.covered_ms <= depart_grace_ms;
+          if track.state != TrackState::Stationary && animate(&track.label) && !hidden {
+            track.dormant = true;
+            track.moving_streak = 0;
+            events.push(SemanticEvent::ObjectLost(snapshot(*id, track)));
+            return true;
+          }
           // a still object that fades mid-frame is still there, the detector
           // just missed it; hold visibility through the longer still grace so
           // a re-sighting is silent continuation instead of a lost/recovered
           // cycle that reopens spans
-          if t_ms - track.last_seen_ms <= self.config.still_lost_grace_ms {
+          if t_ms - track.last_seen_ms <= still_lost_grace_ms {
             return true;
           }
           track.dormant = true;
@@ -765,7 +976,7 @@ impl CameraWorld {
           .tracks
           .get(id)
           .filter(|t| t.state != TrackState::Tentative)
-          .map(|t| snapshot(*id, t))
+          .map(|t| handed_over(snapshot(*id, t), handed.get(id)))
       })
       .collect();
     tracked.extend(late_confirmed);
@@ -786,9 +997,11 @@ impl CameraWorld {
     }
     let mut events = Vec::new();
     for (world_id, label, prev, curr) in segments {
-      let prev = (prev.0, prev.1);
-      let curr = (curr.0, curr.1);
-      if (prev.0 - curr.0).abs() < 1e-9 && (prev.1 - curr.1).abs() < 1e-9 {
+      let Some(track) = self.tracks.get_mut(world_id) else {
+        continue;
+      };
+      // a settled track is where its anchor is, its box flickering across a line goes nowhere
+      if track.state == TrackState::Stationary {
         continue;
       }
       let label_lc = label.to_lowercase();
@@ -800,8 +1013,22 @@ impl CameraWorld {
         if self.crossing_memory.contains(&memory_key) {
           continue;
         }
+        let key = line_idx as u32;
+        if !track.line_sides.contains_key(&key) && line_side(line, *prev).is_some() {
+          track.line_sides.insert(key, *prev);
+        }
+        let Some(side) = line_side(line, *curr) else {
+          continue;
+        };
+        let Some(held) = track.line_sides.insert(key, *curr) else {
+          continue;
+        };
+        if line_side(line, held).is_none_or(|was| was == side) {
+          continue;
+        }
+        let ((from, _), (to, _)) = (held, *curr);
         let cross = segment_intersection(
-          prev.0, prev.1, curr.0, curr.1, line.p1[0], line.p1[1], line.p2[0], line.p2[1],
+          from.0, from.1, to.0, to.1, line.p1[0], line.p1[1], line.p2[0], line.p2[1],
         );
         if cross == 0.0 {
           continue;
@@ -827,14 +1054,10 @@ impl CameraWorld {
           direction,
           track_id: *world_id,
           label: label.clone(),
-          confidence: self
-            .tracks
-            .get(world_id)
-            .map(|t| t.confidence)
-            .unwrap_or(0.0),
+          confidence: track.confidence,
           timestamp_ms: t_ms,
-          prev_pos: [prev.0, prev.1],
-          curr_pos: [curr.0, curr.1],
+          prev_pos: [from.0, from.1],
+          curr_pos: [to.0, to.1],
         });
       }
     }
@@ -847,9 +1070,9 @@ impl CameraWorld {
     bbox: &[f32; 4],
     t_ms: f64,
     tick_detections: &[([f32; 4], f32, i64)],
-  ) -> Option<u32> {
+  ) -> Option<(u32, MatchTier)> {
     let label_id = self.label_ids.get(label).copied();
-    let mut best: Option<(u32, f32)> = None;
+    let mut best: Option<(u32, f32, MatchTier)> = None;
     // fixed order: a map walk would break score ties by hash seed, and a replay
     // has to land on the same identities as the live run
     let mut candidates: Vec<(&u32, &WorldTrack)> = self.tracks.iter().collect();
@@ -883,45 +1106,15 @@ impl CameraWorld {
       // be stale (the standing box of someone who since sat down) while the
       // last box carries the freshest evidence
       for reference in [&track.anchor, &track.bbox] {
-        let iou = box_iou(reference, bbox);
-        // a partial re-sighting (head-only vs full body) fails IoU but keeps one
-        // center inside the other; the size guard only blocks depth confusion
-        // (near vs far person, ~50x apart), body fragments run up to ~5x
-        let area = bbox[2] * bbox[3];
-        let reference_area = reference[2] * reference[3];
-        let size_ok = area <= reference_area * 8.0 && reference_area <= area * 8.0;
-        let contained =
-          size_ok && (center_inside(bbox, reference) || center_inside(reference, bbox));
-        // last resort for detector output flapping between two views of one body
-        // (torso-only vs legs-only, a window seam cutting it in half): centers
-        // within one width sideways and half a height up or down still count.
-        // Per axis, not by the larger side: a standing person is three widths
-        // tall, and a sideways tolerance of half a height would hand the
-        // identity to the next person over
-        let near = size_ok && {
-          let (ax, ay) = (
-            reference[0] + reference[2] / 2.0,
-            reference[1] + reference[3] / 2.0,
-          );
-          let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
-          (bx - ax).abs() <= reference[2].max(bbox[2])
-            && (by - ay).abs() <= reference[3].max(bbox[3]) * 0.5
-        };
-        let score = if iou >= self.config.reassoc_iou {
-          1.0 + iou
-        } else if contained {
-          iou
-        } else if near {
-          iou * 0.5
-        } else {
+        let Some((score, tier)) = spot_match(reference, bbox, self.config.reassoc_iou) else {
           continue;
         };
-        if best.is_none_or(|(_, b)| score > b) {
-          best = Some((*id, score));
+        if best.is_none_or(|(_, b, _)| score > b) {
+          best = Some((*id, score, tier));
         }
       }
     }
-    best.map(|(id, _)| id)
+    best.map(|(id, _, tier)| (id, tier))
   }
 
   fn duplicates_live_track(&self, label: &str, bbox: &[f32; 4], t_ms: f64) -> bool {
@@ -989,6 +1182,41 @@ impl CameraWorld {
   }
 }
 
+fn spot_match(reference: &[f32; 4], bbox: &[f32; 4], reassoc_iou: f32) -> Option<(f32, MatchTier)> {
+  let iou = box_iou(reference, bbox);
+  // a partial re-sighting (head-only vs full body) fails IoU but keeps one
+  // center inside the other; the size guard only blocks depth confusion
+  // (near vs far person, ~50x apart), body fragments run up to ~5x
+  let area = bbox[2] * bbox[3];
+  let reference_area = reference[2] * reference[3];
+  let size_ok = area <= reference_area * 8.0 && reference_area <= area * 8.0;
+  let contained = size_ok && (center_inside(bbox, reference) || center_inside(reference, bbox));
+  // last resort for detector output flapping between two views of one body
+  // (torso-only vs legs-only, a window seam cutting it in half): centers
+  // within one width sideways and half a height up or down still count.
+  // Per axis, not by the larger side: a standing person is three widths
+  // tall, and a sideways tolerance of half a height would hand the
+  // identity to the next person over
+  let near = size_ok && {
+    let (ax, ay) = (
+      reference[0] + reference[2] / 2.0,
+      reference[1] + reference[3] / 2.0,
+    );
+    let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
+    (bx - ax).abs() <= reference[2].max(bbox[2])
+      && (by - ay).abs() <= reference[3].max(bbox[3]) * 0.5
+  };
+  if iou >= reassoc_iou {
+    Some((1.0 + iou, MatchTier::Overlap))
+  } else if contained {
+    Some((iou, MatchTier::Contained))
+  } else if near {
+    Some((iou * 0.5, MatchTier::Near))
+  } else {
+    None
+  }
+}
+
 fn animate(label: &str) -> bool {
   matches!(label, "person" | "animal")
 }
@@ -1014,6 +1242,22 @@ fn center_inside(of: &[f32; 4], within: &[f32; 4]) -> bool {
   let cx = of[0] + of[2] / 2.0;
   let cy = of[1] + of[3] / 2.0;
   cx >= within[0] && cx <= within[0] + within[2] && cy >= within[1] && cy <= within[1] + within[3]
+}
+
+// the side of a line a box center is clearly on, none inside the dead band
+fn line_side(line: &PreparedLine, ((cx, cy), (w, h)): Sighting) -> Option<bool> {
+  let (lx, ly) = (line.p2[0] - line.p1[0], line.p2[1] - line.p1[1]);
+  // distance and extent along the same unnormalized normal (-ly, lx), only their ratio counts
+  let dist = (cy - line.p1[1]) * lx - (cx - line.p1[0]) * ly;
+  let extent = ly.abs() * w + lx.abs() * h;
+  (dist.abs() > extent * LINE_DEAD_BAND).then_some(dist > 0.0)
+}
+
+fn forget_excursions(track: &mut WorldTrack) {
+  track.departures = 0;
+  track.departure_counted = false;
+  track.away = false;
+  track.rest_seen = 0;
 }
 
 fn maybe_best_shot(world_id: u32, track: &mut WorldTrack, events: &mut Vec<SemanticEvent>) {
@@ -1048,7 +1292,22 @@ fn snapshot(id: u32, t: &WorldTrack) -> TrackSnapshot {
     stationary_since_ms: (t.state == TrackState::Stationary).then_some(t.still_since_ms),
     last_seen_ms: t.last_seen_ms,
     attested: t.confirmed_by_witness,
+    wake_cause: None,
+    anchor_distance: None,
+    far_from_anchor: None,
+    handover: None,
+    handover_tier: None,
+    unseen_ms: None,
   }
+}
+
+fn handed_over(mut s: TrackSnapshot, handed: Option<&(Handover, MatchTier, f64)>) -> TrackSnapshot {
+  if let Some(&(kind, tier, unseen_ms)) = handed {
+    s.handover = Some(kind);
+    s.handover_tier = Some(tier);
+    s.unseen_ms = Some(unseen_ms);
+  }
+  s
 }
 
 #[cfg(test)]
@@ -1079,6 +1338,15 @@ mod tests {
     }
   }
 
+  fn entrance_line() -> DetectionLineInput {
+    DetectionLineInput {
+      name: "entrance".to_string(),
+      direction: LineDirectionFilter::Both,
+      labels: Vec::new(),
+      points: [[47.0, 33.0], [69.0, 33.0]],
+    }
+  }
+
   #[test]
   fn crossing_fires_once_per_track() {
     let mut world = CameraWorld::new(WorldConfig::default());
@@ -1091,6 +1359,28 @@ mod tests {
     assert_eq!(crossings.len(), 1);
     assert_eq!(crossings[0].line_name, "gate");
     assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn two_worlds_fed_alike_report_in_the_same_order() {
+    let run = || {
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut said = Vec::new();
+      for i in 0..60 {
+        // eight people walk in side by side and leave together
+        let crowd: Vec<Detection> = if i < 20 {
+          (0..8)
+            .map(|k| person_at(0.02 + k as f32 * 0.11 + i as f32 * 0.004, 0.4))
+            .collect()
+        } else {
+          Vec::new()
+        };
+        let up = world.ingest(i as f64 * 200.0, &crowd, None);
+        said.push(format!("{:?} {:?} {:?}", up.events, up.tracked, up.removed));
+      }
+      said
+    };
+    assert_eq!(run(), run());
   }
 
   #[test]
@@ -1165,6 +1455,178 @@ mod tests {
       crossings += update.crossings.len();
     }
     assert_eq!(crossings, 0);
+  }
+
+  #[test]
+  fn a_box_resting_on_the_line_never_crosses() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let mut crossings = 0;
+    for i in 0..200 {
+      let jitter = if i % 2 == 0 { 0.018 } else { -0.018 };
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.53, 0.23 + jitter, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings += update.crossings.len();
+    }
+    assert_eq!(
+      crossings, 0,
+      "jitter of 9 % of the box height flipped sides"
+    );
+  }
+
+  #[test]
+  fn a_vehicle_parked_on_the_line_stays_silent_through_drift_and_sleep() {
+    // Hof 2026-10-17 02:00: a night detection parked across the line, its center
+    // drifting by a sixth of its height and stepping 0.007 after a recovery
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let car = |cy: f32| box_at(0.62, cy - 0.0965, 0.075, 0.193, "vehicle");
+    let mut crossings = 0;
+    let mut t = 0.0;
+    for i in 0..60 {
+      let jitter = if i % 2 == 0 { 0.001 } else { -0.001 };
+      crossings += world
+        .ingest(t, &[car(0.3301 + jitter)], None)
+        .crossings
+        .len();
+      t += 200.0;
+    }
+    for i in 0..300 {
+      let drift = if i < 150 {
+        i as f32
+      } else {
+        450.0 - 2.0 * i as f32
+      };
+      crossings += world
+        .ingest(t, &[car(0.3301 + drift * 0.0002)], None)
+        .crossings
+        .len();
+      t += 200.0;
+    }
+    t += 70_000.0;
+    for cy in [0.3301, 0.3228, 0.3301, 0.3228, 0.36, 0.30] {
+      crossings += world.ingest(t, &[car(cy)], None).crossings.len();
+      t += 100.0;
+    }
+    assert_eq!(crossings, 0);
+  }
+
+  #[test]
+  fn a_walker_who_stops_on_the_line_crosses_once() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let mut path: Vec<f32> = (0..20).map(|i| 0.13 + i as f32 * 0.01).collect();
+    path.extend((0..25).map(|i| if i % 2 == 0 { 0.34 } else { 0.32 }));
+    path.extend((1..=30).map(|i| 0.33 + i as f32 * 0.01));
+    let mut crossings = Vec::new();
+    for (i, cy) in path.iter().enumerate() {
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.53, cy - 0.1, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings.extend(update.crossings);
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn a_sitter_beside_the_line_who_walks_across_crosses_once() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let mut crossings = Vec::new();
+    let mut settled = false;
+    let mut t = 0.0;
+    for i in 0..350 {
+      let jitter = if i % 2 == 0 { 0.002 } else { -0.002 };
+      let update = world.ingest(t, &[box_at(0.53, 0.18 + jitter, 0.1, 0.2, "person")], None);
+      settled |= update.events.iter().any(|e| e.kind() == "objectSettled");
+      crossings.extend(update.crossings);
+      t += 200.0;
+    }
+    assert!(settled, "the sitter never settled");
+    for i in 1..=20 {
+      let update = world.ingest(
+        t,
+        &[box_at(0.53, 0.18 + i as f32 * 0.02, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings.extend(update.crossings);
+      t += 200.0;
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn walking_past_the_end_of_the_line_never_crosses() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let mut crossings = 0;
+    for i in 0..45 {
+      let cy = 0.15 + i as f32 * 0.01;
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.75, cy - 0.1, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings += update.crossings.len();
+    }
+    assert_eq!(crossings, 0);
+  }
+
+  #[test]
+  fn a_walker_growing_towards_the_camera_crosses() {
+    // the step past the line widens the dead band over the last sighting before it
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let path = [
+      (0.2, 0.1),
+      (0.2, 0.1),
+      (0.2, 0.1),
+      (0.2, 0.1),
+      (0.25, 0.12),
+      (0.29, 0.14),
+      (0.31, 0.15),
+      (0.355, 0.24),
+      (0.4, 0.27),
+      (0.45, 0.3),
+    ];
+    let mut crossings = Vec::new();
+    for (i, (cy, h)) in path.iter().enumerate() {
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.53, cy - h / 2.0, 0.1, *h, "person")],
+        None,
+      );
+      crossings.extend(update.crossings);
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn a_newcomer_seen_first_next_to_the_line_crosses() {
+    // Hof 2026-10-17 03:30: through the gate, first seen 0.22 box heights above
+    // the line, the confirming step lands inside the dead band
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let path = [0.286, 0.286, 0.286, 0.315, 0.355, 0.4, 0.45, 0.5];
+    let mut crossings = Vec::new();
+    for (i, cy) in path.iter().enumerate() {
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.53, cy - 0.1, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings.extend(update.crossings);
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
   }
 
   #[test]
@@ -1322,7 +1784,7 @@ mod tests {
   }
 
   #[test]
-  fn a_round_trip_settled_as_scenery_wakes_when_she_walks_off() {
+  fn a_round_trip_that_fades_goes_out_of_sight_instead_of_scenery() {
     let mut world = CameraWorld::new(WorldConfig::default());
     let at = |b: [f32; 4]| box_at(b[0], b[1], b[2], b[3], "person");
     let lerp =
@@ -1340,26 +1802,24 @@ mod tests {
         t += 200.0;
       }
     }
-    for _ in 0..3 {
-      world.ingest(t, &[at(transit)], None);
-      t += 200.0;
-    }
+    let last_seen = t - 200.0;
     let id = id.expect("confirmed");
-    // crouched at the trolley, unseen long enough for the fade to settle her
-    let mut settled = false;
+    let mut fade = Vec::new();
     while t < 13_000.0 {
       let up = world.ingest(t, &[], None);
-      settled |= up.events.iter().any(|e| e.kind() == "objectSettled");
+      fade.extend(up.events.iter().map(|e| (e.kind(), t)));
       t += 500.0;
     }
-    assert!(settled, "the round trip reads as scenery");
+    assert_eq!(fade.len(), 1, "one event for the fade: {fade:?}");
+    assert_eq!(fade[0].0, "objectLost");
+    assert!(fade[0].1 - last_seen <= WorldConfig::default().depart_grace_ms + 500.0);
+    // crouched at the trolley: the same identity is back in sight
     let crouched = [0.12, 0.75, 0.21, 0.24];
-    for _ in 0..8 {
-      let up = world.ingest(t, &[at(crouched)], None);
-      assert_eq!(up.tracked.first().map(|s| s.track_id), Some(id));
-      assert!(!kinds(&up).contains(&"objectWoke"), "a crouch is no walk");
-      t += 500.0;
-    }
+    let up = world.ingest(t, &[at(crouched)], None);
+    assert_eq!(up.tracked.first().map(|s| s.track_id), Some(id));
+    assert_eq!(kinds(&up), vec!["objectRecovered"]);
+    assert_eq!(up.tracked[0].state, TrackState::Active);
+    t += 500.0;
     // she walks off, never farther from the transit box than half its height
     let away = [0.41, 0.20, 0.16, 0.74];
     let mut states = Vec::new();
@@ -1373,11 +1833,103 @@ mod tests {
       );
       t += 200.0;
     }
-    assert_eq!(
-      states.last(),
-      Some(&TrackState::Active),
+    assert_eq!(states.len(), 10);
+    assert!(
+      states.iter().all(|s| *s == TrackState::Active),
       "a walker held as scenery: {states:?}"
     );
+  }
+
+  #[test]
+  fn someone_moving_in_place_who_fades_goes_out_of_sight_instead_of_scenery() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    // back and forth every 2.5 s, the box never gets half its size away from where it started
+    for i in 0..100 {
+      let phase = (t / 2_500.0 * std::f64::consts::TAU).sin() as f32;
+      world.ingest(
+        t,
+        &[box_at(0.45 + 0.05 * phase, 0.2, 0.09, 0.27, "person")],
+        None,
+      );
+      if i % 25 == 24 {
+        t += 1_500.0;
+      }
+      t += 200.0;
+    }
+    let mut events = Vec::new();
+    for _ in 0..30 {
+      events.extend(kinds(&world.ingest(t, &[], None)));
+      t += 500.0;
+    }
+    assert_eq!(
+      events,
+      vec!["objectLost"],
+      "someone moving in place is no scenery"
+    );
+  }
+
+  #[test]
+  fn a_body_hidden_behind_another_stays_in_sight() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    // two people side by side, both moving in place, the boxes overlapping
+    let pair = |t: f64| {
+      let phase = (t / 2_500.0 * std::f64::consts::TAU).sin() as f32;
+      [
+        box_at(0.44 + 0.04 * phase, 0.20, 0.09, 0.27, "person"),
+        box_at(0.50 + 0.04 * phase, 0.24, 0.09, 0.27, "person"),
+      ]
+    };
+    while t < 10_000.0 {
+      world.ingest(t, &pair(t), None);
+      t += 200.0;
+    }
+    // only the front one is detected for 20 s
+    while t < 30_000.0 {
+      let up = world.ingest(t, &pair(t)[1..], None);
+      assert!(
+        kinds(&up).is_empty(),
+        "the hidden one left the picture: {:?}",
+        kinds(&up)
+      );
+      t += 200.0;
+    }
+    // both walk out unseen
+    let gone = t - 200.0;
+    let mut lost = Vec::new();
+    while t < 45_000.0 {
+      let up = world.ingest(t, &[], None);
+      for e in &up.events {
+        assert_eq!(e.kind(), "objectLost");
+        lost.push(t);
+      }
+      t += 200.0;
+    }
+    assert_eq!(lost.len(), 2);
+    let grace = WorldConfig::default().depart_grace_ms;
+    assert!(
+      lost.iter().all(|at| at - gone <= grace + 400.0),
+      "spans held past the walk-out: {lost:?}"
+    );
+  }
+
+  #[test]
+  fn a_car_that_faded_beside_its_arrival_spot_parks() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    // pulls in past half its width, short of half its diagonal, then stands
+    for i in 0..20 {
+      let x = 0.30 + (i.min(15) as f32) * 0.0128;
+      world.ingest(t, &[box_at(x, 0.5, 0.3, 0.2, "vehicle")], None);
+      t += 200.0;
+    }
+    let mut events = Vec::new();
+    for _ in 0..20 {
+      events.extend(kinds(&world.ingest(t, &[], None)));
+      t += 500.0;
+    }
+    assert_eq!(events, vec!["objectSettled"]);
   }
 
   #[test]
@@ -1634,26 +2186,66 @@ mod tests {
   }
 
   #[test]
-  fn an_occluded_traveler_keeps_its_hold() {
+  fn an_occluded_traveler_goes_out_of_sight_and_keeps_its_identity() {
     let mut world = CameraWorld::new(WorldConfig::default());
     // walks far enough to be a traveler, not far enough to have left
+    let mut id = None;
     for i in 0..15 {
-      world.ingest(
+      let up = world.ingest(
         i as f64 * 200.0,
         &[person_at(0.30 + i as f32 * 0.015, 0.4)],
         None,
       );
+      id = id.or(up.tracked.first().map(|s| s.track_id));
     }
+    let mut events = Vec::new();
     for i in 15..65 {
-      let up = world.ingest(i as f64 * 200.0, &[], None);
-      assert!(
-        !up
-          .events
-          .iter()
-          .any(|e| matches!(e.kind(), "objectSettled" | "objectLost" | "objectDeparted")),
-        "an occluded traveler is neither scenery nor gone"
-      );
+      events.extend(kinds(&world.ingest(i as f64 * 200.0, &[], None)));
     }
+    assert_eq!(
+      events,
+      vec!["objectLost"],
+      "an occluded traveler is neither scenery nor gone"
+    );
+    let up = world.ingest(13_000.0, &[person_at(0.51, 0.4)], None);
+    assert_eq!(up.tracked.first().map(|s| s.track_id), id);
+    assert_eq!(kinds(&up), vec!["objectRecovered"]);
+  }
+
+  #[test]
+  fn a_body_back_within_the_still_grace_keeps_its_still_clock() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    // walks up, then stands
+    for i in 0..10 {
+      world.ingest(t, &[person_at(0.30 + i as f32 * 0.02, 0.4)], None);
+      t += 200.0;
+    }
+    let stood = t;
+    while t < stood + 3_000.0 {
+      world.ingest(t, &[person_at(0.50, 0.4)], None);
+      t += 200.0;
+    }
+    // out of sight for a while, back on the same spot
+    while t < stood + 20_000.0 {
+      world.ingest(t, &[], None);
+      t += 200.0;
+    }
+    let mut settled = None;
+    while settled.is_none() && t < stood + 120_000.0 {
+      let up = world.ingest(t, &[person_at(0.50, 0.4)], None);
+      if kinds(&up).contains(&"objectSettled") {
+        settled = Some(t);
+      }
+      t += 200.0;
+    }
+    let settled = settled.expect("standing still settles");
+    let settle_ms = WorldConfig::default().settle_person_ms;
+    assert!(
+      settled - stood <= settle_ms + 400.0,
+      "the clock restarted on return: {}",
+      settled - stood
+    );
   }
 
   #[test]
@@ -1721,6 +2313,11 @@ mod tests {
     assert!(
       update.crossings.is_empty(),
       "a jump across a decode gap is not a movement"
+    );
+    let update = world.ingest(60_200.0, &[person(0.35)], None);
+    assert!(
+      update.crossings.is_empty(),
+      "the side seen before the gap is not where it crossed"
     );
   }
 
@@ -1829,7 +2426,7 @@ mod tests {
     }
     assert!(created >= 1);
     assert_eq!(woke, 0, "a pan must never wake or move a compensated track");
-    let _ = crossings;
+    assert_eq!(crossings, 0, "the pan carried the person across the line");
   }
 
   #[test]
@@ -1929,7 +2526,7 @@ mod tests {
     let mut entered = 0;
     let mut recovered = 0;
     for i in 0..4 {
-      let up = world.ingest(later + i as f64 * 200.0, &[gate.clone()], None);
+      let up = world.ingest(later + i as f64 * 200.0, std::slice::from_ref(&gate), None);
       entered += up
         .events
         .iter()
@@ -1980,7 +2577,7 @@ mod tests {
     for i in 0..4 {
       let up = world.ingest(
         quiet + 30_000.0 + i as f64 * 200.0,
-        &[neighbour.clone()],
+        std::slice::from_ref(&neighbour),
         None,
       );
       entered += up
@@ -2382,5 +2979,1025 @@ mod tests {
       "the person vanished or was reborn after the pan"
     );
     assert!(up.created.is_empty());
+  }
+
+  struct Lcg(u32);
+
+  impl Lcg {
+    fn next(&mut self) -> f32 {
+      self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      (self.0 >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    fn jitter(&mut self, amp: f32) -> f32 {
+      (self.next() * 2.0 - 1.0) * amp
+    }
+  }
+
+  fn jittered(b: [f32; 4], rng: &mut Lcg, label: &str) -> Detection {
+    box_at(
+      b[0] + rng.jitter(0.003),
+      b[1] + rng.jitter(0.003),
+      b[2] + rng.jitter(0.003),
+      b[3] + rng.jitter(0.003),
+      label,
+    )
+  }
+
+  fn settle_still(
+    world: &mut CameraWorld,
+    dets: &[[f32; 4]],
+    labels: &[&str],
+    rng: &mut Lcg,
+  ) -> f64 {
+    let mut t = 0.0;
+    while t <= WorldConfig::default().settle_person_ms + 1_000.0 {
+      let seen: Vec<Detection> = dets
+        .iter()
+        .zip(labels)
+        .map(|(b, l)| jittered(*b, rng, l))
+        .collect();
+      world.ingest(t, &seen, None);
+      t += 100.0;
+    }
+    assert!(
+      world
+        .tracks
+        .values()
+        .all(|tr| tr.state == TrackState::Stationary),
+      "setup: everything settled"
+    );
+    t
+  }
+
+  fn count(up: &WorldUpdate, kind: &str) -> usize {
+    up.events.iter().filter(|e| e.kind() == kind).count()
+  }
+
+  fn woke_by(up: &WorldUpdate, cause: WakeCause) -> Vec<u32> {
+    up.events
+      .iter()
+      .filter_map(|e| match e {
+        SemanticEvent::ObjectWoke(s) if s.wake_cause == Some(cause) => Some(s.track_id),
+        _ => None,
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_sitter_gesturing_never_wakes() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(11);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let poses = [
+      sit,
+      [0.40, 0.40, 0.16, 0.22],
+      [0.34, 0.40, 0.16, 0.22],
+      [0.40, 0.34, 0.10, 0.28],
+      [0.41, 0.42, 0.12, 0.20],
+      [0.37, 0.38, 0.17, 0.25],
+    ];
+    let mut woke = 0;
+    let mut pose = sit;
+    let mut hold = 0;
+    for _ in 0..6_000 {
+      if hold == 0 {
+        pose = poses[(rng.next() * poses.len() as f32) as usize % poses.len()];
+        hold = 5 + (rng.next() * 25.0) as u32;
+      }
+      hold -= 1;
+      woke += count(
+        &world.ingest(t, &[jittered(pose, &mut rng, "person")], None),
+        "objectWoke",
+      );
+      t += 100.0;
+    }
+    assert_eq!(woke, 0, "a gesture woke the sitter");
+  }
+
+  #[test]
+  fn a_rocking_chair_never_wakes() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(12);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let start = t;
+    let mut woke = 0;
+    for _ in 0..3_000 {
+      let phase = ((t - start) / 2_000.0 * std::f64::consts::TAU).sin() as f32;
+      let b = [
+        sit[0] + 0.03 * phase,
+        sit[1] + 0.015 * phase,
+        sit[2],
+        sit[3] - 0.01 * phase.abs(),
+      ];
+      woke += count(
+        &world.ingest(t, &[jittered(b, &mut rng, "person")], None),
+        "objectWoke",
+      );
+      t += 100.0;
+    }
+    assert_eq!(woke, 0, "rocking in place woke the sitter");
+  }
+
+  #[test]
+  fn exercising_on_the_spot_never_wakes() {
+    let stand = [0.45, 0.30, 0.08, 0.30];
+    let mut rng = Lcg(13);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[stand], &["person"], &mut rng);
+    let moves = [
+      stand,
+      [0.41, 0.28, 0.16, 0.32],
+      [0.45, 0.40, 0.08, 0.20],
+      [0.43, 0.30, 0.08, 0.30],
+      [0.47, 0.30, 0.08, 0.30],
+      [0.42, 0.25, 0.14, 0.35],
+    ];
+    let mut woke = 0;
+    for i in 0..3_000usize {
+      let b = moves[(i / 5) % moves.len()];
+      woke += count(
+        &world.ingest(t, &[jittered(b, &mut rng, "person")], None),
+        "objectWoke",
+      );
+      t += 100.0;
+    }
+    assert_eq!(woke, 0, "exercise in place woke the person");
+  }
+
+  #[test]
+  fn a_pet_on_a_lap_never_wakes() {
+    let sit = [0.40, 0.40, 0.12, 0.24];
+    let pet = [0.43, 0.52, 0.06, 0.05];
+    let mut rng = Lcg(14);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit, pet], &["person", "animal"], &mut rng);
+    let spots = [
+      [0.41, 0.52, 0.06, 0.05],
+      [0.47, 0.53, 0.06, 0.05],
+      [0.44, 0.50, 0.05, 0.06],
+    ];
+    let mut woke = 0;
+    for i in 0..3_000usize {
+      let leg = (i / 15) % spots.len();
+      let next = (leg + 1) % spots.len();
+      let f = (i % 15) as f32 / 15.0;
+      let p: [f32; 4] =
+        std::array::from_fn(|k| spots[leg][k] + (spots[next][k] - spots[leg][k]) * f);
+      let person = [sit[0], sit[1], sit[2] + 0.02 * f, sit[3]];
+      let up = world.ingest(
+        t,
+        &[
+          jittered(person, &mut rng, "person"),
+          jittered(p, &mut rng, "animal"),
+        ],
+        None,
+      );
+      woke += up
+        .events
+        .iter()
+        .filter(|e| matches!(e, SemanticEvent::ObjectWoke(s) if s.label == "person"))
+        .count();
+      t += 100.0;
+    }
+    assert_eq!(woke, 0, "a pet shifting on a lap woke the person");
+  }
+
+  #[test]
+  fn a_pet_hopping_off_its_spot_and_back_never_oscillates() {
+    // out in steps the engine follows, the last one clears the spot, then hidden: never a travel streak
+    let spot = [0.43, 0.52, 0.06, 0.05];
+    let mut rng = Lcg(24);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[spot], &["animal"], &mut rng);
+    let mut oscillated = 0;
+    let mut woke = 0;
+    for _ in 0..48 {
+      for k in 0..=4 {
+        let b = [spot[0] + 0.0125 * k as f32, spot[1], spot[2], spot[3]];
+        let up = world.ingest(t, &[jittered(b, &mut rng, "animal")], None);
+        oscillated += woke_by(&up, WakeCause::Oscillation).len();
+        woke += count(&up, "objectWoke");
+        t += 100.0;
+      }
+      for _ in 0..20 {
+        world.ingest(t, &[], None);
+        t += 100.0;
+      }
+    }
+    assert_eq!(
+      oscillated, 0,
+      "a pet hopping off its spot woke by oscillation"
+    );
+    assert_eq!(woke, 0, "setup: the hops never built a travel streak");
+  }
+
+  #[test]
+  fn a_view_flap_on_a_fragment_anchor_never_wakes() {
+    // walkout multi_hq 263-274 s: recovered on a fragment at the edge, then fragment and body flap
+    let fragment = [0.869, 0.525, 0.057, 0.118];
+    let views = [
+      fragment,
+      [0.869, 0.486, 0.093, 0.196],
+      [0.918, 0.461, 0.065, 0.246],
+      [0.92, 0.431, 0.08, 0.306],
+      [0.869, 0.437, 0.131, 0.238],
+      [0.915, 0.512, 0.085, 0.226],
+    ];
+    let mut rng = Lcg(15);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[fragment], &["person"], &mut rng);
+    let mut woke = 0;
+    for i in 0..1_200usize {
+      let b = views[((i * 7 + (rng.next() * 3.0) as usize) / 4) % views.len()];
+      woke += count(
+        &world.ingest(t, &[jittered(b, &mut rng, "person")], None),
+        "objectWoke",
+      );
+      t += 100.0;
+    }
+    assert_eq!(woke, 0, "a view flap around a fragment anchor woke");
+  }
+
+  #[test]
+  fn someone_running_past_a_sitter_does_not_wake_the_sitter() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(16);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let sitter: Vec<u32> = world.tracks.keys().copied().collect();
+    let start = t;
+    let mut sitter_woke = false;
+    for _ in 0..1_200 {
+      let phase = ((t - start) / 3_000.0 * std::f64::consts::TAU).sin() as f32;
+      let passer = [0.40 + 0.15 * phase, 0.47, 0.06, 0.15];
+      let up = world.ingest(
+        t,
+        &[
+          jittered(sit, &mut rng, "person"),
+          jittered(passer, &mut rng, "person"),
+        ],
+        None,
+      );
+      sitter_woke |= up
+        .events
+        .iter()
+        .any(|e| matches!(e, SemanticEvent::ObjectWoke(s) if sitter.contains(&s.track_id)));
+      t += 100.0;
+    }
+    assert!(!sitter_woke, "the sitter woke on someone running past");
+  }
+
+  #[test]
+  fn someone_moving_in_front_of_a_sitter_never_oscillates_the_sitter() {
+    // the sitter is hidden while covered, the one in front is seen on half the frames
+    for seed in 1..=20u32 {
+      let sit = [0.40, 0.40, 0.10, 0.22];
+      let mut rng = Lcg(100 + seed);
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+      let sitter: Vec<u32> = world.tracks.keys().copied().collect();
+      let start = t;
+      for _ in 0..3_000 {
+        let phase = ((t - start) / 4_000.0 * std::f64::consts::TAU).sin() as f32;
+        let front = [0.42 + 0.14 * phase, 0.44, 0.07, 0.17];
+        let mut seen = Vec::new();
+        if box_iou(&front, &sit) <= 0.15 {
+          seen.push(jittered(sit, &mut rng, "person"));
+        }
+        if rng.next() < 0.5 {
+          seen.push(jittered(front, &mut rng, "person"));
+        }
+        let up = world.ingest(t, &seen, None);
+        let oscillated = woke_by(&up, WakeCause::Oscillation);
+        assert!(
+          !oscillated.iter().any(|id| sitter.contains(id)),
+          "seed {seed}: the sitter's identity woke by oscillation on the one in front at {:.1} s",
+          (t - start) / 1000.0
+        );
+        t += 100.0;
+      }
+    }
+  }
+
+  #[test]
+  fn single_excursions_with_rest_between_never_wake() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(17);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let mut woke = 0;
+    for k in 0..30 {
+      for i in (0..=4).chain((0..=4).rev()) {
+        let dx = 0.04 * i as f32 * if k % 2 == 0 { 1.0 } else { -1.0 };
+        let b = [sit[0] + dx, sit[1], sit[2], sit[3]];
+        woke += count(
+          &world.ingest(t, &[jittered(b, &mut rng, "person")], None),
+          "objectWoke",
+        );
+        t += 100.0;
+      }
+      for _ in 0..200 {
+        woke += count(
+          &world.ingest(t, &[jittered(sit, &mut rng, "person")], None),
+          "objectWoke",
+        );
+        t += 100.0;
+      }
+    }
+    assert_eq!(
+      woke, 0,
+      "single excursions with rest in between woke the sitter"
+    );
+  }
+
+  #[test]
+  fn a_sitter_back_outside_the_spot_after_a_break_never_oscillates() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    // close enough for re-association to resume the sitter, far enough to clear the spot
+    let beside = [sit[0] + 0.09, sit[1] + 0.08, sit[2], sit[3]];
+    // break length, hidden instead of not decoded, first sighting back below the sure margin
+    for (gap, hidden, unsure) in [
+      (10_000.0, false, false),
+      (240_000.0, true, false),
+      (10_000.0, false, true),
+    ] {
+      let mut rng = Lcg(24);
+      let mut world = CameraWorld::new(WorldConfig::default());
+      world.set_min_confidence(0.8);
+      let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+      let mut woke = 0;
+      let mut recovered = 0;
+      // one excursion, back on the spot for a moment, then the break
+      for i in [1, 2, 3, 4, 3, 2, 1, 0] {
+        let b = [sit[0] + 0.04 * i as f32, sit[1], sit[2], sit[3]];
+        woke += count(
+          &world.ingest(t, &[jittered(b, &mut rng, "person")], None),
+          "objectWoke",
+        );
+        t += 100.0;
+      }
+      let resume = t + gap;
+      while hidden && t < resume {
+        woke += count(&world.ingest(t, &[], None), "objectWoke");
+        t += 100.0;
+      }
+      t = resume;
+      for k in 0..5 {
+        let mut d = jittered(beside, &mut rng, "person");
+        if unsure && k == 0 {
+          d.confidence = 0.82;
+        }
+        let up = world.ingest(t, &[d], None);
+        woke += count(&up, "objectWoke");
+        recovered += count(&up, "objectRecovered");
+        t += 100.0;
+      }
+      assert_eq!(recovered, 1, "setup: the sitter resumes after {gap} ms");
+      assert_eq!(
+        woke, 0,
+        "one excursion before a {gap} ms break and one after woke the sitter"
+      );
+    }
+  }
+
+  #[test]
+  fn a_sitter_who_sits_back_differently_never_wakes_on_one_more_reach_out() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    // centre still inside the old spot, IoU about 0.54: too far for the anchor to follow
+    let shifted = [0.43, 0.40, 0.10, 0.22];
+    for (rest_s, seed) in [(60u32, 21u32), (600, 22), (1_800, 23)] {
+      let mut rng = Lcg(seed);
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+      let mut woke = 0;
+      let reach =
+        |world: &mut CameraWorld, t: &mut f64, from: [f32; 4], dir: f32, rng: &mut Lcg| {
+          let mut n = 0;
+          for i in [1, 2, 3, 4, 3, 2, 1] {
+            let b = [from[0] + dir * 0.04 * i as f32, from[1], from[2], from[3]];
+            n += count(
+              &world.ingest(*t, &[jittered(b, rng, "person")], None),
+              "objectWoke",
+            );
+            *t += 100.0;
+          }
+          n
+        };
+      woke += reach(&mut world, &mut t, sit, 1.0, &mut rng);
+      for _ in 0..rest_s * 10 {
+        woke += count(
+          &world.ingest(t, &[jittered(shifted, &mut rng, "person")], None),
+          "objectWoke",
+        );
+        t += 100.0;
+      }
+      woke += reach(&mut world, &mut t, shifted, -1.0, &mut rng);
+      for _ in 0..100 {
+        woke += count(
+          &world.ingest(t, &[jittered(shifted, &mut rng, "person")], None),
+          "objectWoke",
+        );
+        t += 100.0;
+      }
+      assert_eq!(woke, 0, "two reach-outs {rest_s} s apart woke the sitter");
+    }
+  }
+
+  // one trip out of the spot and back as a sparse detector sees it: out in steps the engine can follow, then hidden
+  fn out_and_back(
+    world: &mut CameraWorld,
+    t: &mut f64,
+    rng: &mut Lcg,
+    rest: [f32; 4],
+    reach_out: f32,
+  ) -> Vec<WorldUpdate> {
+    let mut ups = Vec::new();
+    for k in 0..=4 {
+      let dx = reach_out * k as f32 / 4.0;
+      let b = [rest[0] + dx, rest[1], rest[2], rest[3]];
+      ups.push(world.ingest(*t, &[jittered(b, rng, "person")], None));
+      *t += 100.0;
+    }
+    for _ in 0..20 {
+      ups.push(world.ingest(*t, &[], None));
+      *t += 100.0;
+    }
+    ups
+  }
+
+  struct BackAndForth {
+    woke_in_cycle: Option<usize>,
+    settled_after: usize,
+    woke: Vec<TrackSnapshot>,
+  }
+
+  fn back_and_forth(
+    world: &mut CameraWorld,
+    mut t: f64,
+    rng: &mut Lcg,
+    rest: [f32; 4],
+  ) -> BackAndForth {
+    let sitter: Vec<u32> = world.tracks.keys().copied().collect();
+    let mut out = BackAndForth {
+      woke_in_cycle: None,
+      settled_after: 0,
+      woke: Vec::new(),
+    };
+    for cycle in 0..48 {
+      for up in out_and_back(world, &mut t, rng, rest, 0.12) {
+        for e in &up.events {
+          match e {
+            SemanticEvent::ObjectWoke(s) => {
+              out.woke.push(s.clone());
+              out.woke_in_cycle.get_or_insert(cycle);
+            }
+            SemanticEvent::ObjectSettled(s)
+              if out.woke_in_cycle.is_some() && sitter.contains(&s.track_id) =>
+            {
+              out.settled_after += 1
+            }
+            _ => {}
+          }
+        }
+      }
+    }
+    out
+  }
+
+  #[test]
+  fn a_settled_sitter_who_starts_moving_back_and_forth_wakes_and_stays_active() {
+    let rest = [0.30, 0.40, 0.07, 0.20];
+    let mut rng = Lcg(18);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let t = settle_still(&mut world, &[rest], &["person"], &mut rng);
+    let sitter: Vec<u32> = world.tracks.keys().copied().collect();
+    let run = back_and_forth(&mut world, t, &mut rng, rest);
+    assert_eq!(
+      run.woke_in_cycle,
+      Some(1),
+      "the second trip out wakes the sitter"
+    );
+    assert_eq!(
+      run.woke.iter().map(|s| s.track_id).collect::<Vec<_>>(),
+      sitter,
+      "the sitter's own identity wakes, once"
+    );
+    assert_eq!(
+      run.settled_after, 0,
+      "the sitter settled again while moving back and forth"
+    );
+    let woke = &run.woke[0];
+    assert_eq!(woke.wake_cause, Some(WakeCause::Oscillation));
+    let distance = woke.anchor_distance.expect("anchor distance on a wake");
+    assert!(distance > 0.5, "woke inside the spot: {distance}");
+    assert_eq!(woke.far_from_anchor, Some(distance > FAR_FROM_ANCHOR));
+  }
+
+  #[test]
+  fn a_fade_settled_sitter_moving_back_and_forth_wakes() {
+    let rest = [0.30, 0.40, 0.07, 0.20];
+    let mut rng = Lcg(19);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    for _ in 0..20 {
+      world.ingest(t, &[jittered(rest, &mut rng, "person")], None);
+      t += 100.0;
+    }
+    let mut settled = 0;
+    for _ in 0..60 {
+      settled += count(&world.ingest(t, &[], None), "objectSettled");
+      t += 100.0;
+    }
+    assert_eq!(settled, 1, "setup: fade settle");
+    let run = back_and_forth(&mut world, t, &mut rng, rest);
+    assert_eq!(
+      run.woke_in_cycle,
+      Some(1),
+      "the second trip out wakes the sitter"
+    );
+    assert_eq!(run.woke[0].wake_cause, Some(WakeCause::Oscillation));
+  }
+
+  #[test]
+  fn a_sitter_who_woke_and_sat_down_again_counts_afresh() {
+    let rest = [0.30, 0.40, 0.07, 0.20];
+    let mut rng = Lcg(18);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let mut t = settle_still(&mut world, &[rest], &["person"], &mut rng);
+    let mut woke = 0;
+    for _ in 0..2 {
+      for up in out_and_back(&mut world, &mut t, &mut rng, rest, 0.12) {
+        woke += count(&up, "objectWoke");
+      }
+    }
+    assert_eq!(woke, 1, "setup: the second trip out woke the sitter");
+    let mut settled = false;
+    for _ in 0..1_000 {
+      settled = count(
+        &world.ingest(t, &[jittered(rest, &mut rng, "person")], None),
+        "objectSettled",
+      ) > 0;
+      t += 100.0;
+      if settled {
+        break;
+      }
+    }
+    assert!(settled, "setup: the sitter settled again");
+    // straight into one trip out, before the rest at home could clear anything
+    let mut after = 0;
+    for up in out_and_back(&mut world, &mut t, &mut rng, rest, 0.12) {
+      after += count(&up, "objectWoke");
+    }
+    for _ in 0..50 {
+      after += count(
+        &world.ingest(t, &[jittered(rest, &mut rng, "person")], None),
+        "objectWoke",
+      );
+      t += 100.0;
+    }
+    assert_eq!(
+      after, 0,
+      "one trip out after sitting down again woke the sitter"
+    );
+  }
+
+  #[test]
+  fn gentle_swaying_in_place_stays_settled() {
+    let rest = [0.30, 0.40, 0.07, 0.20];
+    let mut rng = Lcg(20);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[rest], &["person"], &mut rng);
+    let mut woke = 0;
+    for _ in 0..48 {
+      for up in out_and_back(&mut world, &mut t, &mut rng, rest, 0.05) {
+        woke += count(&up, "objectWoke");
+      }
+    }
+    assert_eq!(woke, 0, "swaying within the body's own footprint woke");
+  }
+
+  #[test]
+  fn swaying_a_quarter_of_the_body_never_wakes() {
+    let rest = [0.30, 0.40, 0.07, 0.20];
+    for period_ms in [2_000.0, 4_000.0] {
+      let mut rng = Lcg(31);
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut t = settle_still(&mut world, &[rest], &["person"], &mut rng);
+      let start = t;
+      let mut woke = 0;
+      for _ in 0..3_000 {
+        let phase = ((t - start) / period_ms * std::f64::consts::TAU).sin() as f32;
+        let b = [rest[0] + 0.05 * phase, rest[1], rest[2], rest[3]];
+        let seen = if rng.next() < 0.9 {
+          vec![jittered(b, &mut rng, "person")]
+        } else {
+          Vec::new()
+        };
+        woke += count(&world.ingest(t, &seen, None), "objectWoke");
+        t += 100.0;
+      }
+      assert_eq!(
+        woke, 0,
+        "a sway of a quarter body height woke at a {period_ms} ms period"
+      );
+    }
+  }
+
+  #[test]
+  fn a_swaying_false_person_at_the_threshold_never_oscillates() {
+    // a web in front of the lens read as a person just at the user threshold
+    let web = [0.70, 0.10, 0.03, 0.05];
+    let mut rng = Lcg(41);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let mut t = 0.0;
+    while t <= WorldConfig::default().settle_person_ms + 1_000.0 {
+      let mut d = jittered(web, &mut rng, "person");
+      d.confidence = 0.72;
+      world.ingest(t, &[d], None);
+      t += 100.0;
+    }
+    let start = t;
+    let mut oscillated = 0;
+    for k in 0..6_000 {
+      let gust = (k / 200) % 3 == 0;
+      let phase = if gust {
+        ((t - start) / 1_500.0 * std::f64::consts::TAU).sin() as f32
+      } else {
+        0.0
+      };
+      let mut seen = Vec::new();
+      if rng.next() < 0.6 {
+        let mut d = jittered(
+          [
+            web[0] + 0.02 * phase,
+            web[1] + 0.006 * phase,
+            web[2],
+            web[3],
+          ],
+          &mut rng,
+          "person",
+        );
+        d.confidence = 0.6 + 0.12 * rng.next();
+        seen.push(d);
+      }
+      oscillated += woke_by(&world.ingest(t, &seen, None), WakeCause::Oscillation).len();
+      t += 100.0;
+    }
+    assert_eq!(
+      oscillated, 0,
+      "a false person at the threshold woke by oscillation"
+    );
+  }
+
+  #[test]
+  fn a_bystander_never_wakes_while_the_camera_pans() {
+    // the pan residual never clears a thin bystander's spot; a seated one it clears,
+    // and the next pan forgets the departure again
+    for (p, clears) in [
+      ([0.40, 0.40, 0.04, 0.10], false),
+      ([0.40, 0.40, 0.10, 0.12], true),
+    ] {
+      let mut departed = false;
+      // shift, share of the shift the pose report carries, ticks the report lags
+      for (shift, ratio, lag) in [
+        (0.12f32, 0.5f32, 0usize),
+        (0.12, 0.5, 1),
+        (0.10, 0.7, 1),
+        (0.08, 0.5, 0),
+        (0.12, 1.0, 1),
+        (0.16, 0.5, 0),
+        (0.12, 0.33, 0),
+      ] {
+        // ticks at each end: 3 s, then a pan every second and every half second
+        for hold in [30usize, 10, 5] {
+          for seed in 51..=55 {
+            let mut rng = Lcg(seed);
+            let mut world = CameraWorld::new(WorldConfig::default());
+            let mut t = 0.0;
+            while t <= WorldConfig::default().settle_person_ms + 1_000.0 {
+              world.ingest(t, &[jittered(p, &mut rng, "person")], Some((0.0, 0.0)));
+              t += 100.0;
+            }
+            let mut reported = 0.0f32;
+            let mut pending: Vec<f32> = Vec::new();
+            let mut woke = 0;
+            for cycle in 0..20 {
+              let off = if cycle % 2 == 0 { shift } else { 0.0 };
+              for k in 0..hold {
+                if k == 0 {
+                  pending.push(off * ratio);
+                }
+                if !pending.is_empty() && k >= lag {
+                  reported = pending.remove(0);
+                }
+                let b = [p[0] + off, p[1], p[2], p[3]];
+                woke += count(
+                  &world.ingest(t, &[jittered(b, &mut rng, "person")], Some((reported, 0.0))),
+                  "objectWoke",
+                );
+                departed |= world.tracks.values().any(|tr| tr.departures > 0);
+                t += 100.0;
+              }
+            }
+            assert_eq!(
+              woke, 0,
+              "a pan of {shift} reported at {ratio} with lag {lag}, held {hold} ticks, woke the bystander {p:?} (seed {seed})"
+            );
+          }
+        }
+      }
+      assert_eq!(departed, clears, "bystander {p:?}: a departure counted");
+    }
+  }
+
+  #[test]
+  fn a_walk_off_reports_a_travel_wake() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(61);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let mut woke = Vec::new();
+    for i in 1..=20 {
+      let b = [sit[0] + 0.02 * i as f32, sit[1], sit[2], sit[3]];
+      for e in world
+        .ingest(t, &[jittered(b, &mut rng, "person")], None)
+        .events
+      {
+        if let SemanticEvent::ObjectWoke(s) = e {
+          woke.push(s);
+        }
+      }
+      t += 200.0;
+    }
+    assert_eq!(woke.len(), 1, "one wake for one walk-off");
+    assert_eq!(woke[0].wake_cause, Some(WakeCause::Travel));
+    assert!(woke[0].anchor_distance.is_some_and(|d| d > 0.5));
+    assert!(woke[0].far_from_anchor.is_some());
+  }
+
+  #[test]
+  fn walking_into_the_room_reports_a_depth_wake() {
+    let config = WorldConfig::default();
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let near = [0.84, 0.23, 0.16, 0.76];
+    let mut t = 0.0;
+    while t <= config.settle_person_ms + 1_000.0 {
+      world.ingest(t, &[lerp_box(near, near, 0.0)], None);
+      t += 200.0;
+    }
+    let far = [0.90, 0.38, 0.06, 0.38];
+    let mut causes = Vec::new();
+    for i in 1..=20 {
+      for e in world
+        .ingest(t, &[lerp_box(near, far, i as f32 / 20.0)], None)
+        .events
+      {
+        if let SemanticEvent::ObjectWoke(s) = e {
+          causes.push(s.wake_cause);
+        }
+      }
+      t += 200.0;
+    }
+    assert_eq!(causes, vec![Some(WakeCause::Depth)]);
+  }
+
+  #[test]
+  fn a_handover_is_reported_on_its_tick_only() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(71);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let id = *world.tracks.keys().next().unwrap();
+    let handed = |up: &WorldUpdate| {
+      up.tracked
+        .iter()
+        .find(|s| s.track_id == id)
+        .map(|s| (s.handover, s.handover_tier, s.unseen_ms))
+    };
+    // hidden longer than the engine keeps a lost track, shorter than the still grace
+    let last = t - 100.0;
+    for _ in 0..40 {
+      world.ingest(t, &[], None);
+      t += 100.0;
+    }
+    let up = world.ingest(t, &[jittered(sit, &mut rng, "person")], None);
+    let (kind, tier, unseen) = handed(&up).expect("the sitter is picked up again");
+    assert_eq!(kind, Some(Handover::Reassociated));
+    assert_eq!(tier, Some(MatchTier::Overlap));
+    assert!(
+      unseen.is_some_and(|u| (u - (t - last)).abs() < 1.0),
+      "unseen {unseen:?}"
+    );
+    t += 100.0;
+    let up = world.ingest(t, &[jittered(sit, &mut rng, "person")], None);
+    assert_eq!(
+      handed(&up),
+      Some((None, None, None)),
+      "the engine continues, nothing was handed over"
+    );
+    // asleep past the still grace: the recovery carries the handover on event and snapshot
+    t += 100.0;
+    while t < world.tracks[&id].last_seen_ms + WorldConfig::default().still_lost_grace_ms + 1_000.0
+    {
+      world.ingest(t, &[], None);
+      t += 100.0;
+    }
+    assert!(world.tracks[&id].dormant, "setup: asleep");
+    let up = world.ingest(t, &[jittered(sit, &mut rng, "person")], None);
+    let recovered = up.events.iter().find_map(|e| match e {
+      SemanticEvent::ObjectRecovered(s) if s.track_id == id => Some(s.handover),
+      _ => None,
+    });
+    assert_eq!(recovered, Some(Some(Handover::Recovered)));
+    assert_eq!(handed(&up).map(|h| h.0), Some(Some(Handover::Recovered)));
+  }
+
+  #[test]
+  fn a_handover_names_the_tier_it_matched_on() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    for (seen, tier) in [
+      ([0.48, 0.40, 0.10, 0.22], MatchTier::Near),
+      ([0.42, 0.42, 0.06, 0.08], MatchTier::Contained),
+    ] {
+      let mut rng = Lcg(72);
+      let mut world = CameraWorld::new(WorldConfig::default());
+      let mut t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+      let id = *world.tracks.keys().next().unwrap();
+      for _ in 0..40 {
+        world.ingest(t, &[], None);
+        t += 100.0;
+      }
+      let up = world.ingest(t, &[jittered(seen, &mut rng, "person")], None);
+      let handed = up
+        .tracked
+        .iter()
+        .find(|s| s.track_id == id)
+        .map(|s| (s.handover, s.handover_tier));
+      assert_eq!(
+        handed,
+        Some((Some(Handover::Reassociated), Some(tier))),
+        "picked up at {seen:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_newcomer_confirmed_on_its_pickup_was_never_handed_over() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.5);
+    world.ingest(0.0, &[box_at(0.40, 0.40, 0.10, 0.22, "person")], None);
+    let mut t = 100.0;
+    while t < 2_000.0 {
+      world.ingest(t, &[], None);
+      t += 100.0;
+    }
+    let up = world.ingest(t, &[box_at(0.495, 0.40, 0.10, 0.22, "person")], None);
+    assert_eq!(
+      up.created.len(),
+      1,
+      "setup: the pickup confirms the newcomer"
+    );
+    let entered = up
+      .tracked
+      .iter()
+      .find(|s| s.track_id == up.created[0])
+      .map(|s| (s.handover, s.handover_tier, s.unseen_ms));
+    assert_eq!(entered, Some((None, None, None)));
+  }
+
+  #[test]
+  fn a_newcomer_confirming_where_a_body_vanished_before_it_is_that_body() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    while t <= 2_000.0 {
+      world.ingest(t, &[person(0.2)], None);
+      t += 200.0;
+    }
+    let id = *world.tracks.keys().next().unwrap();
+    while t < 4_000.0 {
+      world.ingest(t, &[], None);
+      t += 200.0;
+    }
+    // found again a little off, too far for a pickup, then back on its spot
+    let mut created = Vec::new();
+    let mut handed = None;
+    for x in [0.32, 0.29, 0.26, 0.23, 0.2] {
+      let up = world.ingest(t, &[person(x)], None);
+      created.extend(up.created);
+      handed = handed.or(
+        up.tracked
+          .iter()
+          .find(|s| s.track_id == id)
+          .and_then(|s| s.handover),
+      );
+      t += 200.0;
+    }
+    assert!(created.is_empty(), "the body entered again as {created:?}");
+    assert_eq!(handed, Some(Handover::Reassociated));
+    assert_eq!(world.tracks.len(), 1);
+  }
+
+  #[test]
+  fn a_car_driving_onto_a_parked_cars_spot_is_not_that_car() {
+    let parked = [0.50, 0.40, 0.15, 0.10];
+    let mut rng = Lcg(73);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = settle_still(&mut world, &[parked], &["vehicle"], &mut rng);
+    let id = *world.tracks.keys().next().unwrap();
+    assert_eq!(
+      world.tracks[&id].state,
+      TrackState::Stationary,
+      "setup: parked"
+    );
+    for _ in 0..100 {
+      world.ingest(t, &[], None);
+      t += 100.0;
+    }
+    // born a car length off the spot, on it when it confirms, then on its way
+    let mut created = Vec::new();
+    let mut handed = None;
+    let mut x: f32 = 0.30;
+    while x < 0.8 {
+      let up = world.ingest(t, &[box_at(x, 0.40, 0.15, 0.10, "vehicle")], None);
+      created.extend(up.created);
+      handed = handed.or(
+        up.tracked
+          .iter()
+          .find(|s| s.track_id == id)
+          .and_then(|s| s.handover),
+      );
+      x += 0.04;
+      t += 100.0;
+    }
+    assert_eq!(created.len(), 1, "the passing car never entered");
+    assert_eq!(handed, None, "the parked car was handed to the passing one");
+    assert!(world.tracks.contains_key(&id), "the parked car is gone");
+  }
+
+  #[test]
+  fn a_newcomer_confirming_where_a_flicker_died_was_never_handed_over() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.ingest(0.0, &[person(0.2)], None);
+    let mut t = 200.0;
+    while t < 2_000.0 {
+      world.ingest(t, &[], None);
+      t += 200.0;
+    }
+    let mut entered = Vec::new();
+    for x in [0.32, 0.29, 0.26, 0.23] {
+      let up = world.ingest(t, &[person(x)], None);
+      entered.extend(
+        up.tracked
+          .iter()
+          .filter(|s| up.created.contains(&s.track_id))
+          .map(|s| s.handover),
+      );
+      t += 200.0;
+    }
+    assert_eq!(entered, [None]);
+  }
+
+  #[test]
+  fn a_newcomer_seen_beside_a_body_never_takes_it_over() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_min_confidence(0.7);
+    let seen = |x: f32, confidence: f32| {
+      let mut d = person(x);
+      d.confidence = confidence;
+      d
+    };
+    let mut t = 0.0;
+    while t <= 2_000.0 {
+      world.ingest(t, &[person(0.2)], None);
+      t += 200.0;
+    }
+    let id = *world.tracks.keys().next().unwrap();
+    // a second person comes in while the first is still there, too faint to
+    // confirm, and walks onto the first one's spot once that one is gone
+    world.ingest(t, &[person(0.2), seen(0.45, 0.75)], None);
+    t += 200.0;
+    world.ingest(t, &[person(0.2), seen(0.43, 0.5)], None);
+    t += 100.0;
+    // longer than the engine keeps a lost track, shorter than the depart grace
+    for i in 1..=40 {
+      world.ingest(t, &[seen(0.43 - 0.23 * i as f32 / 40.0, 0.5)], None);
+      t += 100.0;
+    }
+    assert_eq!(
+      world.tracks[&id].state,
+      TrackState::Active,
+      "setup: the first one is still held"
+    );
+    let up = world.ingest(t, &[seen(0.2, 0.9)], None);
+    assert_eq!(up.created.len(), 1, "the second person never entered");
+    assert_ne!(up.created[0], id);
+    let first = up.tracked.iter().find(|s| s.track_id == id);
+    assert!(first.is_none(), "the first one was handed to the second");
   }
 }

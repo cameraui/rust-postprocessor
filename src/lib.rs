@@ -265,6 +265,12 @@ pub struct WorldObject {
   pub stationary_since_ms: Option<f64>,
   pub last_seen_ms: f64,
   pub attested: bool,
+  pub wake_cause: Option<String>,
+  pub anchor_distance: Option<f64>,
+  pub far_from_anchor: Option<bool>,
+  pub handover: Option<String>,
+  pub handover_tier: Option<String>,
+  pub unseen_ms: Option<f64>,
 }
 
 #[napi(object)]
@@ -307,6 +313,32 @@ fn world_object(s: &crate::semantic::TrackSnapshot) -> WorldObject {
     stationary_since_ms: s.stationary_since_ms,
     last_seen_ms: s.last_seen_ms,
     attested: s.attested,
+    wake_cause: s.wake_cause.map(|c| {
+      match c {
+        crate::semantic::WakeCause::Travel => "travel",
+        crate::semantic::WakeCause::Depth => "depth",
+        crate::semantic::WakeCause::Oscillation => "oscillation",
+      }
+      .to_string()
+    }),
+    anchor_distance: s.anchor_distance.map(f64::from),
+    far_from_anchor: s.far_from_anchor,
+    handover: s.handover.map(|h| {
+      match h {
+        crate::semantic::Handover::Recovered => "recovered",
+        crate::semantic::Handover::Reassociated => "reassociated",
+      }
+      .to_string()
+    }),
+    handover_tier: s.handover_tier.map(|t| {
+      match t {
+        crate::semantic::MatchTier::Overlap => "overlap",
+        crate::semantic::MatchTier::Contained => "contained",
+        crate::semantic::MatchTier::Near => "near",
+      }
+      .to_string()
+    }),
+    unseen_ms: s.unseen_ms,
   }
 }
 
