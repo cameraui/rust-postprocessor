@@ -85,6 +85,8 @@ jobs:
             # Upgrade Node.js to 24 (napi-rs images ship Node 18, @napi-rs/cli requires >= 20)
             if command -v apk > /dev/null 2>&1; then
               apk add --no-cache xz
+              # leftover npm 10 files from the image make npm 11 exit 1 without a message
+              rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack
               wget -qO- https://unofficial-builds.nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-x64-musl.tar.xz | tar -xJ -C /usr/local --strip-components=1
             else
               curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
