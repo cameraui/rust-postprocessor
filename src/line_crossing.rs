@@ -23,7 +23,7 @@ pub struct DetectionLineInput {
   pub points: [[f64; 2]; 2],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedLine {
   pub name: String,
   pub direction: LineDirectionFilter,

@@ -212,7 +212,12 @@ impl CameraWorld {
   }
 
   pub fn set_lines(&mut self, lines: Vec<DetectionLineInput>, _aspect_ratio: f32) {
-    self.prepared_lines = prepare_lines(&lines);
+    let prepared = prepare_lines(&lines);
+    // a zone change sends the lines again, a track standing on one must keep its side
+    if prepared == self.prepared_lines {
+      return;
+    }
+    self.prepared_lines = prepared;
     self.crossing_memory.clear();
     for track in self.tracks.values_mut() {
       track.line_sides.clear();
@@ -1523,6 +1528,29 @@ mod tests {
     path.extend((1..=30).map(|i| 0.33 + i as f32 * 0.01));
     let mut crossings = Vec::new();
     for (i, cy) in path.iter().enumerate() {
+      let update = world.ingest(
+        i as f64 * 200.0,
+        &[box_at(0.53, cy - 0.1, 0.1, 0.2, "person")],
+        None,
+      );
+      crossings.extend(update.crossings);
+    }
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(crossings[0].direction, CrossingDirection::AToB);
+  }
+
+  #[test]
+  fn the_same_lines_sent_again_keep_a_walker_who_stopped_on_the_line() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    world.set_lines(vec![entrance_line()], 1.0);
+    let mut path: Vec<f32> = (0..20).map(|i| 0.13 + i as f32 * 0.01).collect();
+    path.extend((0..25).map(|i| if i % 2 == 0 { 0.34 } else { 0.32 }));
+    path.extend((1..=30).map(|i| 0.33 + i as f32 * 0.01));
+    let mut crossings = Vec::new();
+    for (i, cy) in path.iter().enumerate() {
+      if i == 30 {
+        world.set_lines(vec![entrance_line()], 1.0);
+      }
       let update = world.ingest(
         i as f64 * 200.0,
         &[box_at(0.53, cy - 0.1, 0.1, 0.2, "person")],
