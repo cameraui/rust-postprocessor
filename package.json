@@ -41,7 +41,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.10.8",
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@typescript-eslint/parser": "^8.71.2",
+    "@typescript-eslint/parser": "^8.72.0",
     "concurrently": "^10.0.6",
     "cross-env": "^10.1.0",
     "eslint": "9.39.2",
@@ -51,7 +51,7 @@
     "set-interval-async": "^3.0.4",
     "sharp": "^0.35.5",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.71.2",
+    "typescript-eslint": "^8.72.0",
     "updates": "^19.2.1"
   },
   "bugs": {
@@ -72,15 +72,15 @@
     "node": ">= 10"
   },
   "optionalDependencies": {
-    "@camera.ui/rust-postprocessor-darwin-x64": "0.2.1",
-    "@camera.ui/rust-postprocessor-win32-x64-msvc": "0.2.1",
-    "@camera.ui/rust-postprocessor-linux-x64-gnu": "0.2.1",
-    "@camera.ui/rust-postprocessor-linux-x64-musl": "0.2.1",
-    "@camera.ui/rust-postprocessor-freebsd-x64": "0.2.1",
-    "@camera.ui/rust-postprocessor-darwin-arm64": "0.2.1",
-    "@camera.ui/rust-postprocessor-win32-arm64-msvc": "0.2.1",
-    "@camera.ui/rust-postprocessor-linux-arm64-gnu": "0.2.1",
-    "@camera.ui/rust-postprocessor-linux-arm64-musl": "0.2.1",
-    "@camera.ui/rust-postprocessor-linux-riscv64-gnu": "0.2.1"
+    "@camera.ui/rust-postprocessor-darwin-x64": "0.2.2",
+    "@camera.ui/rust-postprocessor-win32-x64-msvc": "0.2.2",
+    "@camera.ui/rust-postprocessor-linux-x64-gnu": "0.2.2",
+    "@camera.ui/rust-postprocessor-linux-x64-musl": "0.2.2",
+    "@camera.ui/rust-postprocessor-freebsd-x64": "0.2.2",
+    "@camera.ui/rust-postprocessor-darwin-arm64": "0.2.2",
+    "@camera.ui/rust-postprocessor-win32-arm64-msvc": "0.2.2",
+    "@camera.ui/rust-postprocessor-linux-arm64-gnu": "0.2.2",
+    "@camera.ui/rust-postprocessor-linux-arm64-musl": "0.2.2",
+    "@camera.ui/rust-postprocessor-linux-riscv64-gnu": "0.2.2"
   }
 }
