@@ -106,6 +106,8 @@ struct WorldTrack {
   first_seen_ms: f64,
   best_shot_score: f32,
   dormant: bool,
+  // a decode gap put it to sleep while consumers still count it visible: when the world saw again
+  held_since_ms: Option<f64>,
   slow_confirm: bool,
   wake_dist: f32,
   // times the box cleared its spot since it last rested there
@@ -142,6 +144,8 @@ pub struct CameraWorld {
   pose_moved_ms: f64,
   // label -> when a camera-side detector last reported it
   attestations: HashMap<String, f64>,
+  // tracks a camera move dropped, reported as removed with the next tick
+  dropped: Vec<u32>,
 }
 
 impl CameraWorld {
@@ -163,6 +167,7 @@ impl CameraWorld {
       pose_baseline: None,
       pose_moved_ms: 0.0,
       attestations: HashMap::new(),
+      dropped: Vec::new(),
     }
   }
 
@@ -225,9 +230,14 @@ impl CameraWorld {
   }
 
   pub fn notify_camera_move(&mut self) {
-    self
-      .tracks
-      .retain(|_, track| !track.dormant && track.state != TrackState::Stationary);
+    let dropped = &mut self.dropped;
+    self.tracks.retain(|id, track| {
+      let keep = !track.dormant && track.state != TrackState::Stationary;
+      if !keep {
+        dropped.push(*id);
+      }
+      keep
+    });
     self
       .engine_map
       .retain(|_, world_id| self.tracks.contains_key(world_id));
@@ -246,6 +256,7 @@ impl CameraWorld {
   ) -> WorldUpdate {
     let mut events = Vec::new();
     let mut created = Vec::new();
+    let mut removed = std::mem::take(&mut self.dropped);
     let mut sightings = Vec::new();
 
     if self.last_t_ms != 0.0 && t_ms - self.last_t_ms > self.config.gap_reset_ms {
@@ -256,16 +267,23 @@ impl CameraWorld {
       self.engine_map.clear();
       self.tracks.retain(|_, t| t.state != TrackState::Tentative);
       for track in self.tracks.values_mut() {
+        if !track.dormant || track.held_since_ms.is_some() {
+          track.held_since_ms = Some(t_ms);
+        }
         track.dormant = true;
         track.moving_streak = 0;
       }
-      self.evict_dormant();
+      removed.extend(self.evict_dormant());
     }
     self.last_t_ms = t_ms;
 
     let dormant_animate_ms = self.config.dormant_animate_ms;
-    self.tracks.retain(|_, t| {
-      !(t.dormant && animate(&t.label) && t_ms - t.last_seen_ms > dormant_animate_ms)
+    self.tracks.retain(|id, t| {
+      let expired = t.dormant && animate(&t.label) && t_ms - t.last_seen_ms > dormant_animate_ms;
+      if expired {
+        removed.push(*id);
+      }
+      !expired
     });
     self
       .engine_map
@@ -476,6 +494,7 @@ impl CameraWorld {
                 first_seen_ms: t_ms,
                 best_shot_score: 0.0,
                 dormant: false,
+                held_since_ms: None,
                 slow_confirm,
                 wake_dist: 0.0,
                 departures: 0,
@@ -621,6 +640,7 @@ impl CameraWorld {
         track.speed_s = (track.velocity_s.0.powi(2) + track.velocity_s.1.powi(2)).sqrt();
       }
       track.dormant = false;
+      track.held_since_ms = None;
       // a segment across a decode gap is not a movement, it is missing time
       if !was_dormant {
         segments.push((
@@ -830,7 +850,6 @@ impl CameraWorld {
       }
     }
 
-    let mut removed = Vec::new();
     let mut removed_quiet = Vec::new();
     let depart_grace_ms = self.config.depart_grace_ms;
     let still_lost_grace_ms = self.config.still_lost_grace_ms;
@@ -840,7 +859,23 @@ impl CameraWorld {
     // last_seen_ms
     let mut late_confirmed: Vec<TrackSnapshot> = Vec::new();
     self.tracks.retain(|id, track| {
-      if seen.contains(id) || track.dormant {
+      if seen.contains(id) {
+        return true;
+      }
+      if track.dormant {
+        // slept through a gap and not back within the grace after it: out of sight
+        let grace = if track.state == TrackState::Stationary {
+          still_lost_grace_ms
+        } else {
+          depart_grace_ms
+        };
+        if track
+          .held_since_ms
+          .is_some_and(|since| t_ms - since > grace)
+        {
+          track.held_since_ms = None;
+          events.push(SemanticEvent::ObjectLost(snapshot(*id, track)));
+        }
         return true;
       }
       if track.state == TrackState::Tentative {
@@ -1166,7 +1201,8 @@ impl CameraWorld {
     }
   }
 
-  fn evict_dormant(&mut self) {
+  fn evict_dormant(&mut self) -> Vec<u32> {
+    let mut evicted = Vec::new();
     while self.tracks.values().filter(|t| t.dormant).count() > self.config.max_dormant {
       let oldest = self
         .tracks
@@ -1180,10 +1216,14 @@ impl CameraWorld {
         })
         .map(|(id, _)| *id);
       match oldest {
-        Some(id) => self.tracks.remove(&id),
+        Some(id) => {
+          self.tracks.remove(&id);
+          evicted.push(id);
+        }
         None => break,
       };
     }
+    evicted
   }
 }
 
@@ -2419,6 +2459,99 @@ mod tests {
     assert!(update.created.is_empty());
     let update = world.ingest(11_600.0, &[person(0.5)], None);
     assert_eq!(update.created.len(), 1);
+  }
+
+  // the cascade paused while an animal walked off: its span must not stay open for hours
+  #[test]
+  fn a_gap_sleeper_that_stays_away_is_lost() {
+    let grace = WorldConfig::default().depart_grace_ms;
+    let mut world = CameraWorld::new(WorldConfig::default());
+    for i in 0..8 {
+      world.ingest(
+        1_000.0 + i as f64 * 200.0,
+        &[person(0.3 + i as f32 * 0.02)],
+        None,
+      );
+    }
+    let mut lost = Vec::new();
+    let mut t = 10_000.0;
+    while t <= 10_000.0 + grace * 2.0 {
+      let up = world.ingest(t, &[], None);
+      lost.extend(
+        up.events
+          .iter()
+          .filter(|e| e.kind() == "objectLost")
+          .map(|_| t),
+      );
+      t += 200.0;
+    }
+    assert_eq!(lost.len(), 1, "lost once: {lost:?}");
+    assert!(
+      lost[0] > 10_000.0 + grace,
+      "the grace runs from the resume, lost at {}",
+      lost[0]
+    );
+  }
+
+  #[test]
+  fn a_gap_sleeper_back_within_the_grace_is_continued() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    for i in 0..8 {
+      world.ingest(
+        1_000.0 + i as f64 * 200.0,
+        &[person(0.3 + i as f32 * 0.02)],
+        None,
+      );
+    }
+    world.ingest(10_000.0, &[], None);
+    let up = world.ingest(12_000.0, &[person(0.44)], None);
+    assert!(up.created.is_empty(), "the identity is kept");
+    assert_eq!(kinds(&up), vec!["objectRecovered"]);
+    // walks on past the old grace: the resume ended the hold
+    for i in 1..=40 {
+      let up = world.ingest(
+        12_000.0 + i as f64 * 200.0,
+        &[person(0.44 + i as f32 * 0.005)],
+        None,
+      );
+      assert!(
+        !kinds(&up).contains(&"objectLost"),
+        "lost while seen at tick {i}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_sleeper_dropped_after_a_long_gap_is_removed() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    for i in 0..8 {
+      world.ingest(
+        1_000.0 + i as f64 * 200.0,
+        &[person(0.3 + i as f32 * 0.02)],
+        None,
+      );
+    }
+    let up = world.ingest(
+      1_000.0 + WorldConfig::default().dormant_animate_ms * 2.0,
+      &[],
+      None,
+    );
+    assert_eq!(up.removed, vec![1]);
+  }
+
+  #[test]
+  fn a_camera_move_reports_the_tracks_it_drops() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut t = 0.0;
+    while t <= WorldConfig::default().settle_vehicle_ms + 1_000.0 {
+      world.ingest(t, &[box_at(0.2, 0.5, 0.3, 0.2, "vehicle")], None);
+      t += 200.0;
+    }
+    world.notify_camera_move();
+    let up = world.ingest(t, &[], None);
+    assert_eq!(up.removed, vec![1], "the parked car went with the move");
+    let up = world.ingest(t + 200.0, &[], None);
+    assert!(up.removed.is_empty(), "reported once");
   }
 
   #[test]
