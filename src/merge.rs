@@ -23,8 +23,7 @@ pub fn merge_detections_contained(
     return Vec::new();
   }
 
-  // in input order, labels by first appearance: the tracker numbers new tracks in
-  // the order the detections reach it, a hash order differs between processes
+  // keep input order: the tracker numbers new tracks in arrival order
   let mut by_label: Vec<(String, Vec<usize>)> = Vec::new();
   for (i, det) in detections.iter().enumerate() {
     match by_label.iter_mut().find(|(label, _)| *label == det.label) {
@@ -157,7 +156,6 @@ fn merge_cluster(
     }
   }
 
-  // clusters by their first member
   let mut slot = vec![usize::MAX; n];
   let mut clusters: Vec<Vec<usize>> = Vec::new();
   for i in 0..n {
@@ -314,7 +312,7 @@ mod tests {
   }
   #[test]
   fn contained_label_keeps_two_people_apart() {
-    // walkout: one lying, one sitting, iou above 0.3 but only half inside
+    // one lying, one sitting: iou above 0.3 but only half inside
     let input = vec![
       det(0.863, 0.474, 0.103, 0.197, 0.52, "person"),
       det(0.920, 0.449, 0.080, 0.235, 0.51, "person"),
@@ -329,7 +327,7 @@ mod tests {
 
   #[test]
   fn contained_label_still_merges_a_fragment() {
-    // hof: the legs of a person inside the full box
+    // the legs of a person inside the full box
     let input = vec![
       det(0.549, 0.046, 0.080, 0.333, 0.80, "person"),
       det(0.549, 0.233, 0.066, 0.149, 0.60, "person"),
@@ -342,8 +340,7 @@ mod tests {
 
   #[test]
   fn contained_label_merges_a_small_fragment_cut_at_a_seam() {
-    // hof: the legs below a window edge and the head of someone crouching, both
-    // far below iou 0.3 but on the body's bottom or top edge
+    // legs below a window edge and a crouching head: far below iou 0.3 but on the body's edge
     let people = vec!["person".to_string()];
     let legs = vec![
       det(0.570, 0.147, 0.062, 0.213, 0.90, "person"),
@@ -369,7 +366,7 @@ mod tests {
 
   #[test]
   fn contained_label_keeps_a_person_hidden_inside_another_box() {
-    // walkout: a woman on the sofa behind the man, 94 % inside his box
+    // a person sitting behind another, 94 % inside the front box
     let input = vec![
       det(0.871, 0.431, 0.129, 0.248, 0.70, "person"),
       det(0.868, 0.524, 0.052, 0.120, 0.53, "person"),

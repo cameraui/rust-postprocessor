@@ -213,8 +213,7 @@ pub fn filter_indices(
       continue;
     }
 
-    // a zone only governs its selected labels: a label no zone selects
-    // passes unconstrained (privacy masks stay label-agnostic)
+    // a label no zone selects passes, privacy masks apply to every label
     let label_lc = det.label.to_lowercase();
 
     let mut dropped = false;
@@ -397,9 +396,9 @@ mod tests {
       ZoneMatchType::Contain,
       vec![],
     )]);
-    // Straddles the zone boundary: not fully contained, must survive.
+    // straddles the boundary, must survive
     let partial = det(0.70, 0.30, 0.20, 0.20, "person");
-    // Fully inside the zone: must be dropped.
+    // fully inside, must be dropped
     let inside = det(0.40, 0.40, 0.10, 0.10, "person");
     let out = filter_detections(vec![partial, inside], &zones, 0.0);
     assert_eq!(out.len(), 1);
@@ -551,8 +550,7 @@ mod tests {
 
   #[test]
   fn full_frame_box_passes_when_label_unselected() {
-    // camera-side motion sensors report full-frame boxes; deselecting motion
-    // in every zone must let them through untouched
+    // camera-side motion sensors report full-frame boxes, unselected motion must pass
     let zones = prepare_zones(&[rect_zone(
       25.0,
       25.0,
@@ -615,7 +613,7 @@ mod tests {
   #[test]
   fn hof_zone_boundary_straddling_filtered() {
     let zones = prepare_zones(&[hof_zone()]);
-    // At x≈0.50 the zone boundary is at y≈0.22; the top-left corner is outside.
+    // at x≈0.50 the boundary sits at y≈0.22, so the top-left corner is outside
     let straddling = det(0.45, 0.15, 0.10, 0.20, "motion");
     let out = filter_detections(vec![straddling], &zones, 0.0);
     assert_eq!(

@@ -17,9 +17,9 @@ pub enum CrossingDirection {
 pub struct DetectionLineInput {
   pub name: String,
   pub direction: LineDirectionFilter,
-  /// Allowed labels (case-insensitive). Empty means "all labels".
+  // case-insensitive, empty means all labels
   pub labels: Vec<String>,
-  /// Handle endpoints in [0, 100] UI coordinates.
+  // ui coordinates in [0, 100]
   pub points: [[f64; 2]; 2],
 }
 
