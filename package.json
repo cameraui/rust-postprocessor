@@ -35,7 +35,7 @@
     "release": "bash scripts/release.sh",
     "test": "cargo test --release",
     "universal": "napi universal",
-    "update": "updates -M npm,pypi,go,cargo,docker,make --update ./",
+    "update": "updates -M npm,pypi,go,cargo,docker --update ./",
     "version": "napi version"
   },
   "devDependencies": {
