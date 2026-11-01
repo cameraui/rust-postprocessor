@@ -42,6 +42,7 @@ export interface Detection {
   height: number
   confidence: number
   label: string
+  clipped?: boolean
 }
 
 export interface DetectionLine {

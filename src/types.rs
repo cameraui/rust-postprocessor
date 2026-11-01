@@ -7,6 +7,9 @@ pub struct Detection {
   pub height: f32,
   pub confidence: f32,
   pub label: String,
+  // cut by an inner edge of the zoom window that saw it
+  #[cfg_attr(feature = "replay", serde(default))]
+  pub clipped: bool,
 }
 
 #[cfg(feature = "replay")]

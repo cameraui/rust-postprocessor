@@ -28,6 +28,7 @@ pub struct Detection {
   pub height: f64,
   pub confidence: f64,
   pub label: String,
+  pub clipped: Option<bool>,
 }
 
 #[napi(object)]
@@ -102,6 +103,7 @@ fn to_internal(d: Detection) -> crate::types::Detection {
     height: d.height as f32,
     confidence: d.confidence as f32,
     label: d.label,
+    clipped: d.clipped.unwrap_or(false),
   }
 }
 
@@ -113,6 +115,7 @@ fn from_internal(d: crate::types::Detection) -> Detection {
     height: d.height as f64,
     confidence: d.confidence as f64,
     label: d.label,
+    clipped: d.clipped.then_some(true),
   }
 }
 

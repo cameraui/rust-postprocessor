@@ -1,8 +1,8 @@
 # @camera.ui/rust-postprocessor
 
-Native Rust detection post-processing for the [camera.ui](https://github.com/seydx/camera.ui) ecosystem — NMS, IoU, box merging, a multi-class IoU + Kalman object tracker, line-crossing events and zone filtering.
+Native Rust detection post-processing for the [camera.ui](https://github.com/cameraui/camera.ui) ecosystem: NMS, IoU, box merging, and a world model per camera that tracks objects, notices when they settle and move again, filters by zone and reports line crossings.
 
-Built with [napi-rs](https://napi.rs) — ships prebuilt binaries for Linux (glibc/musl), macOS, Windows and FreeBSD across x64, arm64 and riscv64, so there is no compile step on install.
+Built with [napi-rs](https://napi.rs). Prebuilt binaries ship for macOS and Windows (x64, arm64), Linux (x64 and arm64 with glibc or musl, riscv64 with glibc) and FreeBSD (x64), so there is no compile step on install.
 
 ## Installation
 
@@ -13,22 +13,25 @@ npm install @camera.ui/rust-postprocessor
 ## Usage
 
 ```ts
-import { nms, merge, ObjectTracker } from '@camera.ui/rust-postprocessor';
+import { CameraWorld, merge, nms } from '@camera.ui/rust-postprocessor';
 
-// Greedy non-maximum suppression (per label), normalized [0,1] boxes
+// greedy non-maximum suppression per label, boxes normalized to 0..1
 const kept = nms(detections, 0.5);
 
-// Cluster nearby/overlapping same-label boxes into union boxes
-const merged = merge(detections, 0.5, 0.02);
+// cluster nearby or overlapping same-label boxes into union boxes
+const merged = merge(kept, 0.5, 0.02);
 
-// Stateful multi-class tracker with stable track ids across frames
-const tracker = new ObjectTracker({ iouThreshold: 0.3, hitCounterMax: 15 });
-const { tracked, crossings } = tracker.update(detections, Date.now());
+// one world per camera, fed every detector frame in time order
+const world = new CameraWorld();
+world.setMinConfidence(0.5);
+const { tracked, events, crossings } = world.ingest(Date.now(), merged);
 ```
 
-Also exposes `nmsIndices`, `boxIou`, and tracker configuration for crossing
-lines (`setLines`), detection zones / privacy masks (`setZones`), confidence
-thresholds and ReID. See `index.d.ts` for the full, documented API.
+`events` carry an `eventType` of `objectEntered`, `objectSettled`, `objectWoke`, `objectLost`, `objectRecovered`, `objectDeparted` or `bestShotUpdated`.
+
+A detection cut off by the edge of a crop can be passed with `clipped: true`. The world keeps such a box on a track it already has, but starts no new track on it.
+
+`CameraWorld` also takes crossing lines (`setLines`), detection zones and privacy masks (`setZones`, `filterIndices`), confidence thresholds per label (`setMinConfidences`), a camera's own detector reports (`attest`) and camera moves (`notifyCameraMove`). `nmsIndices` and `boxIou` are exported as well. See `index.d.ts` for the full API.
 
 ## Development
 
@@ -36,6 +39,7 @@ thresholds and ReID. See `index.d.ts` for the full, documented API.
 npm install
 npm run build        # release build (napi build --platform --release)
 npm run build:debug  # debug build
+npm test             # cargo test --release
 npm run lint         # cargo clippy + eslint
 ```
 

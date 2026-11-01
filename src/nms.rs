@@ -176,6 +176,7 @@ mod tests {
       height: h,
       confidence: conf,
       label: label.to_string(),
+      clipped: false,
     }
   }
 

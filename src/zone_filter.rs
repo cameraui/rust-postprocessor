@@ -301,6 +301,7 @@ mod tests {
       height: h,
       confidence: 0.9,
       label: label.to_string(),
+      clipped: false,
     }
   }
 

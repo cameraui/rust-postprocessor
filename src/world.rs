@@ -23,6 +23,10 @@ const DEPTH_STEP: f32 = 0.12;
 const FAR_FROM_ANCHOR: f32 = 1.0;
 // moving in place needs a score this far above the threshold
 const SURE_MARGIN: f32 = 0.05;
+// a cut view older than this no longer counts toward confirming the body once seen whole
+const CUT_MEMORY_MS: f64 = 2_000.0;
+// a walk away may pause this long after its first step while the body stays off its spot
+const WAKE_WINDOW_MS: f64 = 3_000.0;
 // share of the box extent across the line, a center closer than that is on neither side
 const LINE_DEAD_BAND: f32 = 0.1;
 
@@ -94,11 +98,13 @@ struct WorldTrack {
   last_seen_ms: f64,
   moving_streak: u32,
   first_seen_ms: f64,
+  confirm_from_ms: f64,
   best_shot_score: f32,
   dormant: bool,
   held_since_ms: Option<f64>,
   slow_confirm: bool,
   wake_dist: f32,
+  wake_since_ms: f64,
   departures: u32,
   departure_counted: bool,
   away: bool,
@@ -129,6 +135,8 @@ pub struct CameraWorld {
   // label -> when a camera-side detector last reported it
   attestations: HashMap<String, f64>,
   dropped: Vec<u32>,
+  // engine id -> first and last strong cut view of a body not yet seen whole
+  cut_views: HashMap<u32, (f64, f64)>,
 }
 
 impl CameraWorld {
@@ -138,6 +146,7 @@ impl CameraWorld {
       engine: new_engine(ENGINE_SPLIT),
       tracks: BTreeMap::new(),
       engine_map: HashMap::new(),
+      cut_views: HashMap::new(),
       next_id: 1,
       last_t_ms: 0.0,
       prepared_lines: Vec::new(),
@@ -246,6 +255,7 @@ impl CameraWorld {
       // a gap is no departure: tracks sleep for re-association, unconfirmed flickers go
       self.engine = new_engine(self.engine_split());
       self.engine_map.clear();
+      self.cut_views.clear();
       self.tracks.retain(|_, t| t.state != TrackState::Tentative);
       for track in self.tracks.values_mut() {
         if !track.dormant || track.held_since_ms.is_some() {
@@ -257,6 +267,9 @@ impl CameraWorld {
       removed.extend(self.evict_dormant());
     }
     self.last_t_ms = t_ms;
+    self
+      .cut_views
+      .retain(|_, (_, last)| t_ms - *last <= CUT_MEMORY_MS);
 
     let dormant_animate_ms = self.config.dormant_animate_ms;
     self.tracks.retain(|id, t| {
@@ -305,6 +318,12 @@ impl CameraWorld {
       &HashMap::new(),
     );
     let detections: Vec<&Detection> = kept.iter().map(|&i| &detections[i as usize]).collect();
+    // the engine hands back the box it was fed, so a cut view is known by its box
+    let clipped: Vec<[f32; 4]> = detections
+      .iter()
+      .filter(|d| d.clipped)
+      .map(|d| [d.x, d.y, d.width, d.height])
+      .collect();
 
     let detections: Vec<([f32; 4], f32, i64)> = detections
       .iter()
@@ -389,6 +408,11 @@ impl CameraWorld {
           if (reassociated.is_none() || resumes_sleeper) && !strong {
             continue;
           }
+          // a box cut by a zoom window shows part of a body, it may carry an identity on but not start one
+          if reassociated.is_none() && clipped.contains(&bbox) {
+            self.cut_views.entry(engine_id).or_insert((t_ms, t_ms)).1 = t_ms;
+            continue;
+          }
           // overlapping a live track of the same label is another view of that body, not a newcomer
           if reassociated.is_none() && self.duplicates_live_track(&label, &bbox, t_ms) {
             continue;
@@ -408,6 +432,7 @@ impl CameraWorld {
             };
             handed.insert(id, (kind, tier, t_ms - track.last_seen_ms));
           }
+          let cut_since = self.cut_views.remove(&engine_id).map(|(first, _)| first);
           let id = reassociated.map(|(id, _)| id).unwrap_or_else(|| {
             #[cfg(feature = "replay")]
             if std::env::var("WORLD_DEBUG_BIRTH").is_ok() {
@@ -450,11 +475,14 @@ impl CameraWorld {
                 last_seen_ms: t_ms,
                 moving_streak: 0,
                 first_seen_ms: t_ms,
+                // the cut views before were the same body, they count toward confirming it
+                confirm_from_ms: cut_since.unwrap_or(t_ms),
                 best_shot_score: 0.0,
                 dormant: false,
                 held_since_ms: None,
                 slow_confirm,
                 wake_dist: 0.0,
+                wake_since_ms: 0.0,
                 departures: 0,
                 departure_counted: false,
                 away: false,
@@ -486,7 +514,7 @@ impl CameraWorld {
           } else {
             confirm_ms
           };
-          let confirms = (t_ms - track.first_seen_ms >= wait && strong) || attested;
+          let confirms = (t_ms - track.confirm_from_ms >= wait && strong) || attested;
           let born = track.first_seen_ms;
           let born_at = track.origin;
           let reassoc_iou = self.config.reassoc_iou;
@@ -532,7 +560,7 @@ impl CameraWorld {
         } else {
           confirm_ms
         };
-        let unconfirmed = t_ms - track.first_seen_ms < confirm_ms || !strong;
+        let unconfirmed = t_ms - track.confirm_from_ms < confirm_ms || !strong;
         if unconfirmed && !attested {
           track.bbox = bbox;
           track.anchor = bbox;
@@ -630,26 +658,33 @@ impl CameraWorld {
       if track.state == TrackState::Stationary {
         let anchor_iou = box_iou(&track.anchor, &bbox);
         // waking needs the center out of the anchor's reach and still gaining distance, a view swap jumps once
-        let leaves = |home: &[f32; 4], gained: f32| {
+        let off = |home: &[f32; 4]| {
           let (ax, ay) = (home[0] + home[2] / 2.0, home[1] + home[3] / 2.0);
           let (bx, by) = (bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0);
           let dist = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
           let reach = home[2].max(home[3]);
-          (box_iou(home, &bbox) < 0.15 && dist > reach * 0.5 && dist > gained + 0.005)
-            .then_some(dist)
+          (box_iou(home, &bbox) < 0.15 && dist > reach * 0.5).then_some(dist)
         };
+        let leaves = |home: &[f32; 4], gained: f32| off(home).filter(|dist| *dist > gained + 0.005);
         // a re-association may have handed the identity to another body, its rest starts here
         if !continued {
           track.rest = bbox;
         }
         let from_anchor = leaves(&track.anchor, track.wake_dist);
         // a view that still holds the rest spot is a body coming back into sight, not leaving
-        let from_rest =
-          if track.anchor_seen || !animate(&track.label) || center_inside(&track.rest, &bbox) {
-            None
-          } else {
-            leaves(&track.rest, track.rest_dist)
-          };
+        let rest_counts =
+          !(track.anchor_seen || !animate(&track.label) || center_inside(&track.rest, &bbox));
+        let from_rest = if rest_counts {
+          leaves(&track.rest, track.rest_dist)
+        } else {
+          None
+        };
+        let gaining = moving && (from_anchor.is_some() || from_rest.is_some());
+        // a turn or a missed step on the way out holds the streak, coming back to the spot ends it
+        let pausing = !gaining
+          && track.moving_streak > 0
+          && t_ms - track.wake_since_ms <= WAKE_WINDOW_MS
+          && (off(&track.anchor).is_some() || (rest_counts && off(&track.rest).is_some()));
         // depth walking scales the box away from its rest size, a view growing back scales toward it
         let size = (bbox[2], bbox[3]);
         let in_depth = track.scaling.is_some_and(|(since, sign)| {
@@ -657,11 +692,14 @@ impl CameraWorld {
             && depth_scale((track.anchor[2], track.anchor[3]), size)
               .is_some_and(|s| s * sign >= DEPTH_STEP)
         });
-        if moving && (from_anchor.is_some() || from_rest.is_some()) {
+        if gaining {
+          if track.moving_streak == 0 {
+            track.wake_since_ms = t_ms;
+          }
           track.wake_dist = from_anchor.unwrap_or(track.wake_dist);
           track.rest_dist = from_rest.unwrap_or(track.rest_dist);
           track.moving_streak += 1;
-        } else {
+        } else if !pausing {
           track.moving_streak = 0;
           track.wake_dist = 0.0;
           track.rest_dist = 0.0;
@@ -1257,6 +1295,7 @@ mod tests {
       height: 0.2,
       confidence: 0.9,
       label: "person".to_string(),
+      clipped: false,
     }
   }
 
@@ -2205,6 +2244,7 @@ mod tests {
       height: 0.87,
       confidence: 0.75,
       label: "vehicle".to_string(),
+      clipped: false,
     };
     let mut entered = 0;
     let mut settled = 0;
@@ -2478,6 +2518,7 @@ mod tests {
         height: 0.25,
         confidence: 0.85,
         label: "person".to_string(),
+        clipped: false,
       };
       let update = world.ingest(i as f64 * 200.0, &[d], None);
       for e in update.events {
@@ -2523,6 +2564,79 @@ mod tests {
     assert_eq!(created, 1, "after a camera move everything is new");
   }
 
+  fn clipped(d: Detection) -> Detection {
+    Detection { clipped: true, ..d }
+  }
+
+  #[test]
+  fn a_box_cut_by_a_zoom_window_starts_no_identity() {
+    // the lower part of a parked car where the window ends
+    let mut world = CameraWorld::new(WorldConfig::default());
+    for i in 0..30 {
+      let car = clipped(box_at(0.62, 0.19, 0.06, 0.23, "vehicle"));
+      let up = world.ingest(i as f64 * 200.0, &[car], None);
+      assert!(up.created.is_empty() && up.sightings.is_empty() && up.events.is_empty());
+    }
+  }
+
+  #[test]
+  fn a_body_seen_whole_walks_on_through_cut_views() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut created = Vec::new();
+    let mut last = Vec::new();
+    for i in 0..30 {
+      let walker = person(0.2 + i as f32 * 0.01);
+      let walker = if i < 3 { walker } else { clipped(walker) };
+      let up = world.ingest(i as f64 * 200.0, &[walker], None);
+      created.extend(up.created);
+      last = up.tracked.iter().map(|s| s.track_id).collect();
+    }
+    assert_eq!(
+      created.len(),
+      1,
+      "confirmed on a cut view, still one identity"
+    );
+    assert_eq!(last, created);
+  }
+
+  #[test]
+  fn a_cut_view_becomes_someone_once_seen_whole() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut first_sighting = None;
+    let mut created_at = Vec::new();
+    for i in 0..20 {
+      let walker = person(0.2 + i as f32 * 0.01);
+      let walker = if i < 10 { clipped(walker) } else { walker };
+      let up = world.ingest(i as f64 * 200.0, &[walker], None);
+      if first_sighting.is_none() && !up.sightings.is_empty() {
+        first_sighting = Some(i);
+      }
+      created_at.extend(up.created.iter().map(|_| i));
+    }
+    assert_eq!(first_sighting, Some(10));
+    assert_eq!(
+      created_at,
+      vec![10],
+      "the cut views already waited out the confirmation"
+    );
+  }
+
+  #[test]
+  fn an_old_cut_view_does_not_vouch_for_a_body() {
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let mut created_at = Vec::new();
+    for i in 0..30 {
+      let seen = match i {
+        0..5 => vec![clipped(person(0.3))],
+        5..17 => vec![],
+        _ => vec![person(0.3)],
+      };
+      let up = world.ingest(i as f64 * 200.0, &seen, None);
+      created_at.extend(up.created.iter().map(|_| i));
+    }
+    assert_eq!(created_at, vec![20]);
+  }
+
   fn box_at(x: f32, y: f32, width: f32, height: f32, label: &str) -> Detection {
     Detection {
       x,
@@ -2531,6 +2645,7 @@ mod tests {
       height,
       confidence: 0.9,
       label: label.to_string(),
+      clipped: false,
     }
   }
 
@@ -3768,6 +3883,49 @@ mod tests {
     assert_eq!(woke[0].wake_cause, Some(WakeCause::Travel));
     assert!(woke[0].anchor_distance.is_some_and(|d| d > 0.5));
     assert!(woke[0].far_from_anchor.is_some());
+  }
+
+  fn wakes_along(world: &mut CameraWorld, mut t: f64, path: &[[f32; 4]]) -> Vec<usize> {
+    let mut woke = Vec::new();
+    for (i, b) in path.iter().enumerate() {
+      let up = world.ingest(t, &[box_at(b[0], b[1], b[2], b[3], "person")], None);
+      if up
+        .events
+        .iter()
+        .any(|e| matches!(e, SemanticEvent::ObjectWoke(_)))
+      {
+        woke.push(i);
+      }
+      t += 200.0;
+    }
+    woke
+  }
+
+  #[test]
+  fn a_walk_off_that_stops_between_steps_wakes() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(61);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    // every second tick gains nothing, off the spot from the third step on
+    let path: Vec<[f32; 4]> = (1..=14)
+      .map(|i| [sit[0] + 0.04 * (i / 2) as f32, sit[1], sit[2], sit[3]])
+      .collect();
+    assert_eq!(wakes_along(&mut world, t, &path), vec![9]);
+  }
+
+  #[test]
+  fn a_long_stop_off_the_spot_ends_the_walk_away() {
+    let sit = [0.40, 0.40, 0.10, 0.22];
+    let mut rng = Lcg(61);
+    let mut world = CameraWorld::new(WorldConfig::default());
+    let t = settle_still(&mut world, &[sit], &["person"], &mut rng);
+    let at = |dx: f32| [sit[0] + dx, sit[1], sit[2], sit[3]];
+    // off the spot from the third step, a stand longer than the wake window, one more step
+    let mut path: Vec<[f32; 4]> = (1..=4).map(|i| at(0.04 * i as f32)).collect();
+    path.extend(std::iter::repeat_n(at(0.16), 16));
+    path.push(at(0.20));
+    assert_eq!(wakes_along(&mut world, t, &path), Vec::<usize>::new());
   }
 
   #[test]

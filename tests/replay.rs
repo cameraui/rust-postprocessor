@@ -22,6 +22,7 @@ fn det(x: f32, y: f32, w: f32, h: f32, confidence: f32, label: &str) -> Detectio
     height: h,
     confidence,
     label: label.to_string(),
+    clipped: false,
   }
 }
 

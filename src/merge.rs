@@ -218,6 +218,7 @@ fn merge_cluster(
       height: h,
       confidence: max_conf,
       label: template.label.clone(),
+      clipped: members.iter().all(|&m| detections[indices[m]].clipped),
     });
   }
 }
@@ -234,6 +235,7 @@ mod tests {
       height: h,
       confidence: conf,
       label: label.to_string(),
+      clipped: false,
     }
   }
 
