@@ -35,12 +35,12 @@
     "release": "bash scripts/release.sh",
     "test": "cargo test --release",
     "universal": "napi universal",
-    "update": "updates -M npm,pypi,go,cargo,docker --update ./",
+    "update": "updates -M npm,pypi,go,cargo,docker -u",
     "version": "napi version"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.12",
-    "@stylistic/eslint-plugin": "^6.0.0",
+    "@stylistic/eslint-plugin": "^5.10.0",
     "@typescript-eslint/parser": "^8.72.2",
     "concurrently": "^10.0.7",
     "cross-env": "^10.1.0",
