@@ -22,7 +22,7 @@
     ]
   },
   "scripts": {
-    "audit": "npm audit fix",
+    "audit": "npm audit fix --min-release-age=0",
     "artifacts": "napi artifacts",
     "build:debug": "napi build --platform",
     "build": "napi build --platform --release",
