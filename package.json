@@ -61,7 +61,13 @@
   "keywords": [
     "camera-ui",
     "postprocessing",
-    "rust"
+    "rust",
+    "camera.ui",
+    "napi-rs",
+    "nms",
+    "iou",
+    "object-tracking",
+    "detection"
   ],
   "license": "MIT",
   "repository": {
