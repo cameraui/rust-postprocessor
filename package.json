@@ -41,7 +41,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.10.12",
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@typescript-eslint/parser": "^8.72.2",
+    "@typescript-eslint/parser": "^8.73.0",
     "concurrently": "^10.0.7",
     "cross-env": "^10.1.0",
     "eslint": "9.39.2",
@@ -51,8 +51,8 @@
     "set-interval-async": "^3.0.6",
     "sharp": "^0.35.5",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.72.2",
-    "updates": "^20.0.1"
+    "typescript-eslint": "^8.73.0",
+    "updates": "^20.0.2"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rust-postprocessor/issues"
